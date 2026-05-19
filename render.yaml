@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: rp-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: BOT_TOKEN
+        sync: false        # задаётся вручную в Render Dashboard
+      - key: DATABASE_URL
+        sync: false        # postgres-строка из Neon
+      - key: ALLOWED_CHAT_IDS
+        sync: false        # например: -1001234567890
+      - key: WEBHOOK_SECRET
+        generateValue: true
