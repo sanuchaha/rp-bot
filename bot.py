@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
@@ -1556,7 +1557,11 @@ async def _run_webhook(token: str, base_url: str) -> None:
 
     # Путь делаем непредсказуемым, чтобы посторонние не дёргали вебхук.
     webhook_path = os.environ.get("WEBHOOK_PATH") or f"/tg/{token.split(':')[0]}"
-    webhook_secret = os.environ.get("WEBHOOK_SECRET") or None
+    # Telegram allows only [A-Za-z0-9_-] in secret_token (1..256). Render-сгенерированный
+    # секрет может содержать другие символы — отфильтруем; пустой результат => без секрета.
+    _raw_secret = os.environ.get("WEBHOOK_SECRET") or ""
+    _clean_secret = re.sub(r"[^A-Za-z0-9_-]", "", _raw_secret)[:256]
+    webhook_secret = _clean_secret or None
     webhook_url = base_url.rstrip("/") + webhook_path
     port = int(os.environ.get("PORT", "8080"))
 
