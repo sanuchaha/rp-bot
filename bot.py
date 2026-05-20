@@ -1434,6 +1434,50 @@ async def on_duel_decline(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
+@router.message(Command("yield"))
+async def cmd_yield(message: Message, bot: Bot) -> None:
+    remember_user(message.from_user)
+    user_id = message.from_user.id
+    duel_id = user_duel.get(user_id)
+    duel = duels.get(duel_id) if duel_id is not None else None
+    if duel is None:
+        await message.answer("Ты сейчас не в дуэли.")
+        return
+
+    initiator_name = display_name(duel.initiator_id)
+    opponent_name = display_name(duel.opponent_id)
+    quitter_name = display_name(user_id)
+    other_id = (
+        duel.opponent_id if user_id == duel.initiator_id else duel.initiator_id
+    )
+    other_name = display_name(other_id)
+    was_active = duel.status == DuelStatus.ACTIVE
+
+    _cleanup_duel(duel)
+
+    if was_active:
+        text = (
+            f"🏳️ {quitter_name} вышел из дуэли с {other_name}.\n"
+            f"Дуэль завершена. Оба игрока выведены из боя."
+        )
+    else:
+        text = (
+            f"❌ {quitter_name} отменил вызов "
+            f"{initiator_name} → {opponent_name}."
+        )
+
+    await _refresh_duel_message(bot, duel)
+    try:
+        await bot.send_message(duel.chat_id, text)
+    except Exception as exc:
+        logging.warning("Не удалось отправить сообщение о выходе из дуэли: %s", exc)
+        if message.chat.id != duel.chat_id:
+            await message.answer(text)
+    if message.chat.id != duel.chat_id:
+        # Эхо лично вызвавшему, чтобы получил подтверждение (если писал в личку).
+        await message.answer("Готово — дуэль завершена.")
+
+
 # ---------------------------------------------------------------------------
 # Сервисные команды
 # ---------------------------------------------------------------------------
@@ -1452,6 +1496,7 @@ async def cmd_help(message: Message) -> None:
         "/fif — управление состоянием активного персонажа в бою (урон / лечение)\n"
         "/duel @username — вызвать игрока на дуэль (только в группах)\n"
         "    └ альтернативно: /duel в ответ на сообщение игрока\n"
+        "/yield — выйти из текущей дуэли (сдаться)\n"
         "/top — список всех игроков и их персонажей\n"
         "/jesus — воскресить любого без сознания персонажа (выбор из меню)\n"
         "/help — это сообщение\n\n"
@@ -1725,6 +1770,7 @@ BOT_COMMANDS = [
     BotCommand(command="persona", description="Управление персонажами"),
     BotCommand(command="fif", description="Управление в бою"),
     BotCommand(command="duel", description="Вызов на дуэль (в группе)"),
+    BotCommand(command="yield", description="Выйти из текущей дуэли"),
     BotCommand(command="top", description="Список всех игроков и их персонажей"),
     BotCommand(command="jesus", description="Воскресить персонажа из больницы"),
     BotCommand(command="help", description="Помощь"),
