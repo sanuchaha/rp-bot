@@ -1453,6 +1453,7 @@ async def cmd_help(message: Message) -> None:
         "/duel @username — вызвать игрока на дуэль (только в группах)\n"
         "    └ альтернативно: /duel в ответ на сообщение игрока\n"
         "/top — список всех игроков и их персонажей\n"
+        "/jesus — воскресить любого без сознания персонажа (выбор из меню)\n"
         "/help — это сообщение\n\n"
         "<b>⚔️ Классы и проценты от макс. ХП</b>\n"
         f"{CLASS_LABELS[CharClass.ATTACKER]}\n"
@@ -1557,6 +1558,117 @@ async def cmd_top(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /jesus — воскрешение любого "в больнице" персонажа (любым игроком)
+# ---------------------------------------------------------------------------
+
+# Соответствие token → [(owner_uid, char_name), ...] для открытых меню.
+# Токен короткий, чтобы влезать в 64-байтный лимит callback_data.
+_jesus_menus: dict[str, list[tuple[int, str]]] = {}
+_MAX_JESUS_MENUS = 50  # грубая LRU-отсечка, чтобы не росло бесконечно
+
+
+def _gc_jesus_menus() -> None:
+    if len(_jesus_menus) > _MAX_JESUS_MENUS:
+        for k in list(_jesus_menus.keys())[: len(_jesus_menus) - _MAX_JESUS_MENUS]:
+            _jesus_menus.pop(k, None)
+
+
+@router.message(Command("jesus"))
+async def cmd_jesus(message: Message) -> None:
+    remember_user(message.from_user)
+    dead: list[tuple[int, Character]] = []
+    for uid, chars in characters.items():
+        for ch in chars.values():
+            if ch.current_hp <= 0:
+                dead.append((uid, ch))
+
+    if not dead:
+        await message.answer("Никого в больнице нет 🌞")
+        return
+
+    # Сортируем: сначала по владельцу, потом по имени персонажа.
+    dead.sort(key=lambda item: (display_name(item[0]).lower(), item[1].name.lower()))
+
+    import secrets
+    token = secrets.token_urlsafe(6)
+    _jesus_menus[token] = [(uid, ch.name) for uid, ch in dead]
+    _gc_jesus_menus()
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, (uid, ch) in enumerate(dead):
+        owner = display_name(uid)
+        label = f"💀 {ch.name} · {owner}"
+        # Telegram ограничивает button text — держимся в пределах.
+        if len(label) > 64:
+            label = label[:61] + "…"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"jesus:{token}:{idx}")]
+        )
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"jesus:{token}:cancel")])
+
+    await message.answer(
+        f"⛪️ <b>Кого воскрешаем?</b> · в больнице: {len(dead)}\n"
+        "<i>Любой игрок может воскресить любого персонажа. ХП восстановится до максимума.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("jesus:"))
+async def on_jesus_choice(cb: CallbackQuery) -> None:
+    remember_user(cb.from_user)
+    parts = (cb.data or "").split(":", 2)
+    if len(parts) != 3:
+        await cb.answer()
+        return
+    _, token, payload = parts
+
+    if payload == "cancel":
+        _jesus_menus.pop(token, None)
+        try:
+            await cb.message.edit_text("❌ Отменено.")
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
+    try:
+        idx = int(payload)
+    except ValueError:
+        await cb.answer()
+        return
+
+    menu = _jesus_menus.get(token)
+    if menu is None or idx < 0 or idx >= len(menu):
+        await cb.answer("Меню устарело, вызови /jesus заново.", show_alert=True)
+        return
+
+    uid, name = menu[idx]
+    chars = characters.get(uid) or {}
+    ch = chars.get(name)
+    if ch is None:
+        await cb.answer("Персонаж не найден (возможно, удалён).", show_alert=True)
+        return
+    if ch.current_hp > 0:
+        await cb.answer("Этот персонаж уже жив.", show_alert=True)
+        return
+
+    ch.current_hp = ch.max_hp
+    ch.in_battle = False
+    save_state()
+    _jesus_menus.pop(token, None)
+
+    owner = html.escape(display_name(uid))
+    healer = html.escape(display_name(cb.from_user.id))
+    name_html = html.escape(ch.name)
+    await cb.message.edit_text(
+        f"✨ <b>{name_html}</b> воскрешён! ❤️ <b>{ch.max_hp}</b>/{ch.max_hp}\n"
+        f"Владелец: {owner}\n"
+        f"Чудотворец: {healer}"
+    )
+    await cb.answer("Воскрешено!", show_alert=False)
+
+
+# ---------------------------------------------------------------------------
 # Ограничение по chat_id
 # ---------------------------------------------------------------------------
 
@@ -1614,6 +1726,7 @@ BOT_COMMANDS = [
     BotCommand(command="fif", description="Управление в бою"),
     BotCommand(command="duel", description="Вызов на дуэль (в группе)"),
     BotCommand(command="top", description="Список всех игроков и их персонажей"),
+    BotCommand(command="jesus", description="Воскресить персонажа из больницы"),
     BotCommand(command="help", description="Помощь"),
 ]
 
