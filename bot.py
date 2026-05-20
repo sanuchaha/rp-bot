@@ -1144,6 +1144,38 @@ async def cmd_fif(message: Message) -> None:
     )
 
 
+def _active_duel_opponent_max_hp(user_id: int) -> Optional[int]:
+    """Если игрок в АКТИВНОЙ дуэли — вернуть max_hp персонажа оппонента. Иначе None."""
+    duel_id = user_duel.get(user_id)
+    if duel_id is None:
+        return None
+    duel = duels.get(duel_id)
+    if duel is None or duel.status != DuelStatus.ACTIVE:
+        return None
+    if duel.initiator_id == user_id:
+        opp_id, opp_name = duel.opponent_id, duel.opponent_char
+    elif duel.opponent_id == user_id:
+        opp_id, opp_name = duel.initiator_id, duel.initiator_char
+    else:
+        return None
+    opp_ch = get_chars(opp_id).get(opp_name)
+    return opp_ch.max_hp if opp_ch is not None else None
+
+
+def _hp_advantage_reduction(my_max_hp: int, opp_max_hp: Optional[int]) -> int:
+    """Сколько п.п. вычесть из базового процента урона за преимущество по ОП."""
+    if opp_max_hp is None or opp_max_hp <= 0 or my_max_hp <= opp_max_hp:
+        return 0
+    ratio = my_max_hp / opp_max_hp
+    if ratio >= 4.0:    # ≥4х (превышение в 300%+)
+        return 3
+    if ratio >= 2.0:    # ≥2х (в 100%+)
+        return 2
+    if ratio >= 1.25:   # ≥25% превышения
+        return 1
+    return 0
+
+
 @router.callback_query(F.data.startswith("hp:"))
 async def on_hp_change(cb: CallbackQuery, bot: Bot) -> None:
     remember_user(cb.from_user)
@@ -1160,8 +1192,12 @@ async def on_hp_change(cb: CallbackQuery, bot: Bot) -> None:
 
     stats = CLASS_STATS[ch.char_class]
     action = cb.data.split(":")[1] if cb.data else ""
+    reduction_pp = 0
     if action == "damage":
-        delta = -(ch.max_hp * stats["damage_pct"]) // 100
+        opp_max = _active_duel_opponent_max_hp(user_id)
+        reduction_pp = _hp_advantage_reduction(ch.max_hp, opp_max)
+        effective_pct = max(1, stats["damage_pct"] - reduction_pp)
+        delta = -(ch.max_hp * effective_pct) // 100
     elif action == "heal":
         delta = (ch.max_hp * stats["heal_pct"]) // 100
     else:
@@ -1193,7 +1229,13 @@ async def on_hp_change(cb: CallbackQuery, bot: Bot) -> None:
         )
         if duel is not None and duel.status == DuelStatus.ACTIVE:
             await _refresh_duel_message(bot, duel)
-    await cb.answer()
+    if reduction_pp > 0 and action == "damage":
+        await cb.answer(
+            f"Снижение урона за преимущество по ОП: −{reduction_pp} п.п.",
+            show_alert=False,
+        )
+    else:
+        await cb.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -1430,7 +1472,13 @@ async def cmd_help(message: Message) -> None:
         "5. Для дуэли — в группе с ботом: /duel @username или в ответ на сообщение. "
         "Дуэль идёт между активными персонажами обоих игроков.\n\n"
         "<i>ХП не восстанавливается автоматически после боя — финальное значение "
-        "сохраняется в карточке персонажа. Восстановить ХП можно вручную в /persona.</i>"
+        "сохраняется в карточке персонажа. Восстановить ХП можно вручную в /persona.</i>\n\n"
+        "<b>⚖️ Бонус за преимущество по ОП (только в дуэли)</b>\n"
+        "Если у твоего персонажа max ОП больше, чем у соперника, получаемый урон снижается:\n"
+        "• в ≥1.25х → −1 п.п.\n"
+        "• в ≥2х → −2 п.п.\n"
+        "• в ≥4х → −3 п.п.\n"
+        "Минимум — 1% за нажатие. На лечение не влияет."
     )
 
 
