@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -1409,6 +1410,7 @@ async def cmd_help(message: Message) -> None:
         "/fif — управление состоянием активного персонажа в бою (урон / лечение)\n"
         "/duel @username — вызвать игрока на дуэль (только в группах)\n"
         "    └ альтернативно: /duel в ответ на сообщение игрока\n"
+        "/top — список всех игроков и их персонажей\n"
         "/help — это сообщение\n\n"
         "<b>⚔️ Классы и проценты от макс. ХП</b>\n"
         f"{CLASS_LABELS[CharClass.ATTACKER]}\n"
@@ -1430,6 +1432,80 @@ async def cmd_help(message: Message) -> None:
         "<i>ХП не восстанавливается автоматически после боя — финальное значение "
         "сохраняется в карточке персонажа. Восстановить ХП можно вручную в /persona.</i>"
     )
+
+
+# ---------------------------------------------------------------------------
+# /top — список всех зарегистрированных игроков и их персонажей
+# ---------------------------------------------------------------------------
+
+# Telegram ограничивает сообщение 4096 символами — режем с запасом.
+TOP_MESSAGE_LIMIT = 3800
+
+
+def _build_top_lines() -> list[str]:
+    players: list[tuple[int, list[Character]]] = []
+    for uid, chars in characters.items():
+        if not chars:
+            continue
+        players.append((uid, list(chars.values())))
+
+    if not players:
+        return []
+
+    players.sort(key=lambda item: (-len(item[1]), display_name(item[0]).lower()))
+
+    total_chars = sum(len(chars) for _, chars in players)
+    lines: list[str] = [
+        f"🏆 <b>Игроки бота</b> — {len(players)} чел., персонажей: {total_chars}",
+        "",
+    ]
+    for idx, (uid, chars) in enumerate(players, 1):
+        uname = html.escape(display_name(uid))
+        active_name = active_char.get(uid)
+        lines.append(f"{idx}. <b>{uname}</b> — персонажей: {len(chars)}")
+        for ch in chars:
+            marker = "⭐" if ch.name == active_name else "  "
+            alive = "❤️" if ch.current_hp > 0 else "💀"
+            name_html = html.escape(ch.name)
+            lines.append(
+                f"   {marker} {alive} <i>{name_html}</i> — {CLASS_LABELS[ch.char_class]} "
+                f"<b>{ch.current_hp}</b>/{ch.max_hp}"
+            )
+        lines.append("")
+    return lines
+
+
+def _chunk_lines(lines: list[str], limit: int) -> list[str]:
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
+    for line in lines:
+        # +1 за перевод строки
+        add_len = len(line) + 1
+        if buf and buf_len + add_len > limit:
+            chunks.append("\n".join(buf).rstrip())
+            buf = []
+            buf_len = 0
+        buf.append(line)
+        buf_len += add_len
+    if buf:
+        tail = "\n".join(buf).rstrip()
+        if tail:
+            chunks.append(tail)
+    return chunks
+
+
+@router.message(Command("top"))
+async def cmd_top(message: Message) -> None:
+    remember_user(message.from_user)
+    lines = _build_top_lines()
+    if not lines:
+        await message.answer(
+            "Пока никто не зарегистрировал персонажей. Введите /start, чтобы стать первым."
+        )
+        return
+    for chunk in _chunk_lines(lines, TOP_MESSAGE_LIMIT):
+        await message.answer(chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1565,7 @@ BOT_COMMANDS = [
     BotCommand(command="persona", description="Управление персонажами"),
     BotCommand(command="fif", description="Управление в бою"),
     BotCommand(command="duel", description="Вызов на дуэль (в группе)"),
+    BotCommand(command="top", description="Список всех игроков и их персонажей"),
     BotCommand(command="help", description="Помощь"),
 ]
 
