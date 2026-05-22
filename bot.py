@@ -90,6 +90,20 @@ def _parse_chat_ids(raw: str) -> set[int]:
 ALLOWED_CHAT_IDS: set[int] = _parse_chat_ids(os.environ.get("ALLOWED_CHAT_IDS", ""))
 
 
+def _parse_owner_id(raw: str) -> Optional[int]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logging.warning("OWNER_ID: не int '%s' — игнорирую", raw)
+        return None
+
+
+OWNER_ID: Optional[int] = _parse_owner_id(os.environ.get("OWNER_ID", ""))
+
+
 # ---------------------------------------------------------------------------
 # Модель данных
 # ---------------------------------------------------------------------------
@@ -3179,7 +3193,8 @@ async def cmd_help(message: Message) -> None:
         f"+{HEALER_HOT_PERMILLE / 10:.1f}% ХП каждая.\n"
         "/yield — выйти из текущей дуэли / командного боя (сдаться)\n"
         "/top — список всех игроков и их персонажей\n"
-        "/jesus — воскресить любого без сознания персонажа (выбор из меню)\n"
+        "/jesus — воскресить любого без сознания персонажа (выбор из меню; "
+        "если задан OWNER_ID — только владелец)\n"
         "/help — это сообщение\n\n"
         "<b>⚔️ Классы и проценты от макс. ХП</b>\n"
         f"{CLASS_LABELS[CharClass.ATTACKER]}\n"
@@ -3321,6 +3336,9 @@ def _gc_jesus_menus() -> None:
 @router.message(Command("jesus"))
 async def cmd_jesus(message: Message) -> None:
     remember_user(message.from_user)
+    if OWNER_ID is not None and message.from_user.id != OWNER_ID:
+        await message.answer("⛔️ Команда /jesus доступна только владельцу бота.")
+        return
     dead: list[tuple[int, Character]] = []
     for uid, chars in characters.items():
         for ch in chars.values():
@@ -3351,9 +3369,13 @@ async def cmd_jesus(message: Message) -> None:
         )
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"jesus:{token}:cancel")])
 
+    intro = (
+        "<i>Только владелец бота может воскрешать любого персонажа. ХП восстановится до максимума.</i>"
+        if OWNER_ID is not None
+        else "<i>Любой игрок может воскресить любого персонажа. ХП восстановится до максимума.</i>"
+    )
     await message.answer(
-        f"⛪️ <b>Кого воскрешаем?</b> · в больнице: {len(dead)}\n"
-        "<i>Любой игрок может воскресить любого персонажа. ХП восстановится до максимума.</i>",
+        f"⛪️ <b>Кого воскрешаем?</b> · в больнице: {len(dead)}\n{intro}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -3361,6 +3383,9 @@ async def cmd_jesus(message: Message) -> None:
 @router.callback_query(F.data.startswith("jesus:"))
 async def on_jesus_choice(cb: CallbackQuery) -> None:
     remember_user(cb.from_user)
+    if OWNER_ID is not None and cb.from_user.id != OWNER_ID:
+        await cb.answer("⛔️ Только владелец бота может воскрешать.", show_alert=True)
+        return
     parts = (cb.data or "").split(":", 2)
     if len(parts) != 3:
         await cb.answer()
