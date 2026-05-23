@@ -105,6 +105,67 @@ OWNER_ID: Optional[int] = _parse_owner_id(os.environ.get("OWNER_ID", ""))
 
 
 # ---------------------------------------------------------------------------
+# Реролл бросков — кнопка «🎲 Перебросить» на сообщениях с бросками.
+# Доступ: владелец бота (OWNER_ID) + те, кому он явно выдал право командой
+# /grant_reroll. Каждый игрок может перебросить свой бросок максимум 2 раза.
+# ---------------------------------------------------------------------------
+
+# Хранится в _serialize_state / load_state.
+reroll_users: set[int] = set()
+
+# In-memory registry — токен → состояние реролла (snapshot для отката + replay-данные).
+# Не персистится: реролл живёт до перезапуска бота.
+_REROLLS: dict[str, dict] = {}
+_REROLL_COUNTER: int = 0
+_MAX_REROLL_REGISTRY = 500
+MAX_REROLLS_PER_USE = 2
+
+
+def _can_reroll(user_id: int) -> bool:
+    """Право использовать кнопку перебросить.
+
+    Если OWNER_ID не задан — реролл отключён вообще (фича опциональна, в DEV-режиме
+    без владельца её просто нет). Если задан — владелец всегда может, остальные —
+    только если их id в reroll_users.
+    """
+    if OWNER_ID is None:
+        return False
+    if user_id == OWNER_ID:
+        return True
+    return user_id in reroll_users
+
+
+def _new_reroll_token() -> str:
+    global _REROLL_COUNTER
+    _REROLL_COUNTER += 1
+    return f"r{_REROLL_COUNTER}"
+
+
+def _gc_rerolls() -> None:
+    if len(_REROLLS) > _MAX_REROLL_REGISTRY:
+        keys = list(_REROLLS.keys())
+        for k in keys[: len(_REROLLS) - _MAX_REROLL_REGISTRY]:
+            _REROLLS.pop(k, None)
+
+
+def _reroll_kb(token: str, count: int) -> Optional[InlineKeyboardMarkup]:
+    """Кнопка реролла, если ещё остались попытки."""
+    if count >= MAX_REROLLS_PER_USE:
+        return None
+    left = MAX_REROLLS_PER_USE - count
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🎲 Перебросить ({left} ост.)",
+                    callback_data=f"reroll:{token}",
+                )
+            ]
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Модель данных
 # ---------------------------------------------------------------------------
 
@@ -307,6 +368,7 @@ def _serialize_state() -> dict[str, Any]:
         "active_char": {str(uid): name for uid, name in active_char.items()},
         "username_to_id": username_to_id,
         "user_display": {str(uid): name for uid, name in user_display.items()},
+        "reroll_users": sorted(reroll_users),
     }
 
 
@@ -393,6 +455,12 @@ async def load_state() -> None:
     for uid_str, name in data.get("user_display", {}).items():
         try:
             user_display[int(uid_str)] = name
+        except (ValueError, TypeError):
+            continue
+
+    for uid_raw in data.get("reroll_users", []):
+        try:
+            reroll_users.add(int(uid_raw))
         except (ValueError, TypeError):
             continue
 
@@ -1673,24 +1741,73 @@ async def _handle_knockout(bot: Bot, duel: Duel, ch: Character) -> None:
     _cleanup_duel(duel)
 
 
-async def _resolve_pending(
-    bot: Bot,
+def _invalidate_duel_rerolls(duel_id: int) -> None:
+    """Удаляет все pending-токены реролла для этой дуэли (старые кнопки перестают работать)."""
+    for tok in [t for t, info in _REROLLS.items() if info.get("duel_id") == duel_id]:
+        _REROLLS.pop(tok, None)
+
+
+def _invalidate_battle_rerolls(battle_id: int) -> None:
+    """Удаляет все pending-токены реролла для этого командного боя."""
+    for tok in [t for t, info in _REROLLS.items() if info.get("battle_id") == battle_id]:
+        _REROLLS.pop(tok, None)
+
+
+def _capture_duel_resolve_snapshot(duel: Duel, responder_id: int) -> dict:
+    """Снимок состояния перед резолвом pending-действия в дуэли.
+
+    Запоминает HP/in_battle обоих участников и pending — чтобы при рерролле
+    откатить и переиграть с новым роллом."""
+    initiator_id = duel.pending_attacker_id
+    initiator_ch = _duel_char_of(duel, initiator_id) if initiator_id is not None else None
+    responder_ch = _duel_char_of(duel, responder_id)
+    return {
+        "initiator_id": initiator_id,
+        "responder_id": responder_id,
+        "initiator_hp": initiator_ch.current_hp if initiator_ch else None,
+        "responder_hp": responder_ch.current_hp if responder_ch else None,
+        "initiator_in_battle": initiator_ch.in_battle if initiator_ch else None,
+        "responder_in_battle": responder_ch.in_battle if responder_ch else None,
+        "pending_kind": duel.pending_kind,
+        "pending_attacker_id": duel.pending_attacker_id,
+        "pending_attack_cap": duel.pending_attack_cap,
+        "pending_attack_roll": duel.pending_attack_roll,
+    }
+
+
+def _restore_duel_resolve_snapshot(duel: Duel, snapshot: dict) -> None:
+    initiator_id = snapshot["initiator_id"]
+    responder_id = snapshot["responder_id"]
+    initiator_ch = _duel_char_of(duel, initiator_id) if initiator_id is not None else None
+    responder_ch = _duel_char_of(duel, responder_id)
+    if initiator_ch is not None and snapshot["initiator_hp"] is not None:
+        initiator_ch.current_hp = snapshot["initiator_hp"]
+        initiator_ch.in_battle = bool(snapshot["initiator_in_battle"])
+    if responder_ch is not None and snapshot["responder_hp"] is not None:
+        responder_ch.current_hp = snapshot["responder_hp"]
+        responder_ch.in_battle = bool(snapshot["responder_in_battle"])
+    duel.pending_kind = snapshot["pending_kind"]
+    duel.pending_attacker_id = snapshot["pending_attacker_id"]
+    duel.pending_attack_cap = snapshot["pending_attack_cap"]
+    duel.pending_attack_roll = snapshot["pending_attack_roll"]
+
+
+def _build_duel_resolve_result(
     duel: Duel,
     response_kind: str,
     response_roll: int,
     response_cap: int,
     responder_id: int,
-) -> None:
-    """Разрешает pending-действие (attack или heal_resist) реакцией защитника.
+) -> tuple[list[str], Optional[Character]]:
+    """Применяет резолв pending-действия (мутирует ХП, чистит pending) и возвращает (lines, knocked_out).
 
-    response_kind: 'defend' / 'attack' / 'heal'. Сравнивается бросок pending-инициатора
-    с броском ответчика: у кого больше — у того действие «выигрывает». Ничья — обамимо."""
+    Возвращает пустой список, если pending некорректный."""
     pending_kind = duel.pending_kind
     initiator_id = duel.pending_attacker_id
     pending_roll = duel.pending_attack_roll
     pending_cap = duel.pending_attack_cap
     if pending_kind is None or initiator_id is None or pending_roll is None:
-        return
+        return [], None
 
     initiator_ch = _duel_char_of(duel, initiator_id)
     responder_ch = _duel_char_of(duel, responder_id)
@@ -1776,12 +1893,59 @@ async def _resolve_pending(
         elif response_kind == "heal":
             lines.append(f"⚖️ Хил <b>{responder_name}</b> не сработал.")
 
+    return lines, knocked_out
+
+
+async def _resolve_pending(
+    bot: Bot,
+    duel: Duel,
+    response_kind: str,
+    response_roll: int,
+    response_cap: int,
+    responder_id: int,
+) -> None:
+    """Разрешает pending-действие (attack или heal_resist) реакцией защитника.
+
+    response_kind: 'defend' / 'attack' / 'heal'. Сравнивается бросок pending-инициатора
+    с броском ответчика: у кого больше — у того действие «выигрывает». Ничья — обамимо."""
+    # Все прежние кнопки «Перебросить» этой дуэли больше не валидны — новое действие
+    # переинициализирует состояние.
+    _invalidate_duel_rerolls(duel.duel_id)
+
+    snapshot = _capture_duel_resolve_snapshot(duel, responder_id)
+    lines, knocked_out = _build_duel_resolve_result(
+        duel, response_kind, response_roll, response_cap, responder_id
+    )
+    if not lines:
+        return
     save_state()
 
+    text = "\n".join(lines)
+    token: Optional[str] = None
+    kb: Optional[InlineKeyboardMarkup] = None
+    if knocked_out is None and _can_reroll(responder_id):
+        token = _new_reroll_token()
+        _REROLLS[token] = {
+            "kind": "duel_resolve",
+            "user_id": responder_id,
+            "count": 0,
+            "duel_id": duel.duel_id,
+            "cap": response_cap,
+            "response_kind": response_kind,
+            "snapshot": snapshot,
+        }
+        _gc_rerolls()
+        kb = _reroll_kb(token, 0)
+
     try:
-        await bot.send_message(duel.chat_id, "\n".join(lines))
+        sent = await bot.send_message(duel.chat_id, text, reply_markup=kb)
+        if token is not None:
+            _REROLLS[token]["chat_id"] = sent.chat.id
+            _REROLLS[token]["message_id"] = sent.message_id
     except Exception as exc:  # noqa: BLE001
         logging.warning("resolve pending: %s", exc)
+        if token is not None:
+            _REROLLS.pop(token, None)
 
     if knocked_out is not None:
         await _handle_knockout(bot, duel, knocked_out)
@@ -1851,25 +2015,58 @@ async def cmd_attack(message: Message, command: CommandObject, bot: Bot) -> None
         )
         return
 
+    # Новая атака — старые реролл-кнопки этой дуэли больше не валидны.
+    _invalidate_duel_rerolls(duel.duel_id)
+
     duel.pending_kind = "attack"
     duel.pending_attacker_id = user_id
     duel.pending_attack_cap = attack_cap
     duel.pending_attack_roll = attack_roll
 
     atk_name = html.escape(display_name(user_id))
+    atk_char = html.escape(attacker_ch.name)
     def_name = html.escape(display_name(defender_id))
+
+    text = _duel_pending_attack_text(atk_name, atk_char, attack_roll, attack_cap, def_name)
+    token: Optional[str] = None
+    kb: Optional[InlineKeyboardMarkup] = None
+    if _can_reroll(user_id):
+        token = _new_reroll_token()
+        _REROLLS[token] = {
+            "kind": "duel_pending_attack",
+            "user_id": user_id,
+            "count": 0,
+            "duel_id": duel.duel_id,
+            "cap": attack_cap,
+            "atk_name": atk_name,
+            "atk_char": atk_char,
+            "def_name": def_name,
+        }
+        _gc_rerolls()
+        kb = _reroll_kb(token, 0)
+
     try:
-        await bot.send_message(
-            duel.chat_id,
-            f"⚔️ <b>{atk_name}</b> ({html.escape(attacker_ch.name)}) атакует — "
-            f"🎲 бот кинул <b>{attack_roll}</b> из 1–{attack_cap}.\n"
-            f"🛡 <b>{def_name}</b> — ответь любым: "
-            f"<code>/defend &lt;макс&gt;</code>, <code>/attack &lt;макс&gt;</code> или "
-            f"<code>/heal &lt;макс&gt;</code>.",
-        )
+        sent = await bot.send_message(duel.chat_id, text, reply_markup=kb)
+        if token is not None:
+            _REROLLS[token]["chat_id"] = sent.chat.id
+            _REROLLS[token]["message_id"] = sent.message_id
     except Exception as exc:  # noqa: BLE001
         logging.warning("attack: не удалось отправить сообщение: %s", exc)
+        if token is not None:
+            _REROLLS.pop(token, None)
     await _refresh_duel_message(bot, duel)
+
+
+def _duel_pending_attack_text(
+    atk_name: str, atk_char: str, roll: int, cap: int, def_name: str
+) -> str:
+    return (
+        f"⚔️ <b>{atk_name}</b> ({atk_char}) атакует — "
+        f"🎲 бот кинул <b>{roll}</b> из 1–{cap}.\n"
+        f"🛡 <b>{def_name}</b> — ответь любым: "
+        f"<code>/defend &lt;макс&gt;</code>, <code>/attack &lt;макс&gt;</code> или "
+        f"<code>/heal &lt;макс&gt;</code>."
+    )
 
 
 @router.message(Command("defend"))
@@ -2075,66 +2272,177 @@ async def _cmd_heal_team_battle(
     self_heal = tgt_id == user_id
     target_html = "себя" if self_heal else f"<b>{target_label}</b> ({target_char_html})"
 
+    # Новое действие — прежние реролл-кнопки этого боя невалидны.
+    _invalidate_battle_rerolls(battle.battle_id)
+
     cd_left = battle.heal_cooldown.get(user_id, 0)
     if cd_left > 0:
         # Заблокировано КД. Для Лекаря с активным HoT — применяем тик к ОРИГИНАЛЬНОЙ цели.
-        lines = [
-            f"🕒 <b>{healer_label}</b> пробует /heal: 🎲 <b>{roll}</b> из 1–{cap}, "
-            f"но лечение на КД ({cd_left} ход(а))."
-        ]
-        if is_healer:
-            hot = battle.heal_hot.get(user_id)
-            if hot is not None:
-                hot_target_id = hot.get("target_id")
-                hot_target_char_name = hot.get("target_char")
-                hot_target_ch = (
-                    get_chars(hot_target_id).get(hot_target_char_name)
-                    if hot_target_id is not None and hot_target_char_name
-                    else None
-                )
-                if hot_target_ch is not None and hot_target_ch.current_hp > 0:
-                    heal_amt = max(
-                        1, (hot_target_ch.max_hp * HEALER_HOT_PERMILLE) // 1000
-                    )
-                    before = hot_target_ch.current_hp
-                    hot_target_ch.current_hp = min(
-                        hot_target_ch.max_hp, before + heal_amt
-                    )
-                    hot_label_raw = (
-                        "ты сам" if hot_target_id == user_id else display_name(hot_target_id)
-                    )
-                    hot_label = html.escape(hot_label_raw)
-                    lines.append(
-                        f"🌿 Продолжение лечения: <b>{hot_label}</b> "
-                        f"({html.escape(hot_target_ch.name)}) "
-                        f"+{heal_amt} ХП ({HEALER_HOT_PERMILLE / 10:.1f}%): "
-                        f"{before} → <b>{hot_target_ch.current_hp}</b>"
-                        f"/{hot_target_ch.max_hp}."
-                    )
-                    hot["ticks_left"] = max(0, int(hot.get("ticks_left", 0)) - 1)
-                    if hot["ticks_left"] <= 0:
-                        battle.heal_hot.pop(user_id, None)
-                else:
-                    # Цель HoT недоступна — снимаем эффект.
-                    battle.heal_hot.pop(user_id, None)
+        # Снимок для возможного реролла.
+        hot_pre = battle.heal_hot.get(user_id)
+        snap_users = [user_id]
+        if hot_pre is not None and hot_pre.get("target_id") is not None:
+            snap_users.append(int(hot_pre["target_id"]))
+        snapshot = _capture_battle_full_snapshot(battle, *snap_users)
 
-        battle.heal_cooldown[user_id] = cd_left - 1
-        if battle.heal_cooldown[user_id] == 0:
-            battle.heal_cooldown.pop(user_id, None)
-            lines.append("✅ КД лечения закончится со следующего хода.")
-        else:
-            lines.append(
-                f"⏳ КД лечения теперь: <b>{battle.heal_cooldown[user_id]}</b> ход(а)."
-            )
+        lines, healed_target_id, healed_label = _battle_heal_cd_tick(
+            battle, healer_label, healer_ch, roll, cap, cd_left, is_healer, user_id
+        )
+
         save_state()
+
+        text = "\n".join(lines)
+        token: Optional[str] = None
+        kb: Optional[InlineKeyboardMarkup] = None
+        # Нельзя реролить, если был тик HoT, и цель уже померла — нечего откатывать?
+        # Просто разрешаем, если у пользователя есть право.
+        if _can_reroll(user_id):
+            token = _new_reroll_token()
+            _REROLLS[token] = {
+                "kind": "battle_heal_cd_tick",
+                "user_id": user_id,
+                "count": 0,
+                "battle_id": battle.battle_id,
+                "cap": cap,
+                "healer_label": healer_label,
+                "is_healer": is_healer,
+                "snapshot": snapshot,
+            }
+            _gc_rerolls()
+            kb = _reroll_kb(token, 0)
         try:
-            await message.answer("\n".join(lines))
+            sent = await message.answer(text, reply_markup=kb)
+            if token is not None and sent is not None:
+                _REROLLS[token]["chat_id"] = sent.chat.id
+                _REROLLS[token]["message_id"] = sent.message_id
         except Exception as exc:  # noqa: BLE001
             logging.warning("heal (team battle, cd-tick): %s", exc)
+            if token is not None:
+                _REROLLS.pop(token, None)
         await _refresh_battle_message(bot, battle)
         return
 
-    # КД = 0 — лечение успешно.
+    # КД = 0 — лечение успешно. Снимок для отката.
+    snapshot = _capture_battle_full_snapshot(battle, user_id, tgt_id)
+
+    lines, cd_turns = _battle_heal_apply(
+        battle, healer_label, healer_ch, target_ch, roll, cap, tgt_id,
+        target_html, target_char_html, is_healer, user_id,
+    )
+
+    save_state()
+
+    text = "\n".join(lines)
+    token: Optional[str] = None
+    kb: Optional[InlineKeyboardMarkup] = None
+    if _can_reroll(user_id):
+        token = _new_reroll_token()
+        _REROLLS[token] = {
+            "kind": "battle_heal_apply",
+            "user_id": user_id,
+            "count": 0,
+            "battle_id": battle.battle_id,
+            "cap": cap,
+            "tgt_id": tgt_id,
+            "healer_label": healer_label,
+            "target_html": target_html,
+            "target_char_html": target_char_html,
+            "is_healer": is_healer,
+            "snapshot": snapshot,
+        }
+        _gc_rerolls()
+        kb = _reroll_kb(token, 0)
+    try:
+        sent = await message.answer(text, reply_markup=kb)
+        if token is not None and sent is not None:
+            _REROLLS[token]["chat_id"] = sent.chat.id
+            _REROLLS[token]["message_id"] = sent.message_id
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("heal (team battle, apply): %s", exc)
+        if token is not None:
+            _REROLLS.pop(token, None)
+    await _refresh_battle_message(bot, battle)
+
+
+def _battle_heal_cd_tick(
+    battle: Battle,
+    healer_label: str,
+    healer_ch: Character,
+    roll: int,
+    cap: int,
+    cd_left: int,
+    is_healer: bool,
+    user_id: int,
+) -> tuple[list[str], Optional[int], Optional[str]]:
+    """Применяет тик при попытке /heal во время КД (включая HoT). Мутирует battle."""
+    lines = [
+        f"🕒 <b>{healer_label}</b> пробует /heal: 🎲 <b>{roll}</b> из 1–{cap}, "
+        f"но лечение на КД ({cd_left} ход(а))."
+    ]
+    healed_id: Optional[int] = None
+    healed_label: Optional[str] = None
+    if is_healer:
+        hot = battle.heal_hot.get(user_id)
+        if hot is not None:
+            hot_target_id = hot.get("target_id")
+            hot_target_char_name = hot.get("target_char")
+            hot_target_ch = (
+                get_chars(hot_target_id).get(hot_target_char_name)
+                if hot_target_id is not None and hot_target_char_name
+                else None
+            )
+            if hot_target_ch is not None and hot_target_ch.current_hp > 0:
+                heal_amt = max(
+                    1, (hot_target_ch.max_hp * HEALER_HOT_PERMILLE) // 1000
+                )
+                before = hot_target_ch.current_hp
+                hot_target_ch.current_hp = min(
+                    hot_target_ch.max_hp, before + heal_amt
+                )
+                hot_label_raw = (
+                    "ты сам" if hot_target_id == user_id else display_name(hot_target_id)
+                )
+                hot_label = html.escape(hot_label_raw)
+                lines.append(
+                    f"🌿 Продолжение лечения: <b>{hot_label}</b> "
+                    f"({html.escape(hot_target_ch.name)}) "
+                    f"+{heal_amt} ХП ({HEALER_HOT_PERMILLE / 10:.1f}%): "
+                    f"{before} → <b>{hot_target_ch.current_hp}</b>"
+                    f"/{hot_target_ch.max_hp}."
+                )
+                hot["ticks_left"] = max(0, int(hot.get("ticks_left", 0)) - 1)
+                if hot["ticks_left"] <= 0:
+                    battle.heal_hot.pop(user_id, None)
+                healed_id = hot_target_id
+                healed_label = hot_label
+            else:
+                battle.heal_hot.pop(user_id, None)
+
+    battle.heal_cooldown[user_id] = cd_left - 1
+    if battle.heal_cooldown[user_id] == 0:
+        battle.heal_cooldown.pop(user_id, None)
+        lines.append("✅ КД лечения закончится со следующего хода.")
+    else:
+        lines.append(
+            f"⏳ КД лечения теперь: <b>{battle.heal_cooldown[user_id]}</b> ход(а)."
+        )
+    return lines, healed_id, healed_label
+
+
+def _battle_heal_apply(
+    battle: Battle,
+    healer_label: str,
+    healer_ch: Character,
+    target_ch: Character,
+    roll: int,
+    cap: int,
+    tgt_id: int,
+    target_html: str,
+    target_char_html: str,
+    is_healer: bool,
+    user_id: int,
+) -> tuple[list[str], int]:
+    """Применяет успешное лечение в командном бою. Мутирует battle и target_ch."""
     heal_pct, verdict = _team_battle_heal_pct(healer_ch, roll)
     heal_amount = max(1, (target_ch.max_hp * heal_pct) // 100)
     before = target_ch.current_hp
@@ -2156,18 +2464,14 @@ async def _cmd_heal_team_battle(
             f"/heal, цели прилетает +{HEALER_HOT_PERMILLE / 10:.1f}% ХП."
         )
 
-    save_state()
-    try:
-        await message.answer(
-            f"🌿 <b>{healer_label}</b> ({CLASS_LABELS[healer_ch.char_class]}) лечит "
-            f"{target_html} — 🎲 <b>{roll}</b> из 1–{cap} — {verdict}.\n"
-            f"❤️ {target_char_html}: {before} → <b>{target_ch.current_hp}</b>"
-            f"/{target_ch.max_hp} (+{target_ch.current_hp - before}).\n"
-            f"🕒 КД лечения: <b>{cd_turns}</b> хода.{hot_note}"
-        )
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("heal (team battle, apply): %s", exc)
-    await _refresh_battle_message(bot, battle)
+    lines = [
+        f"🌿 <b>{healer_label}</b> ({CLASS_LABELS[healer_ch.char_class]}) лечит "
+        f"{target_html} — 🎲 <b>{roll}</b> из 1–{cap} — {verdict}.\n"
+        f"❤️ {target_char_html}: {before} → <b>{target_ch.current_hp}</b>"
+        f"/{target_ch.max_hp} (+{target_ch.current_hp - before}).\n"
+        f"🕒 КД лечения: <b>{cd_turns}</b> хода.{hot_note}"
+    ]
+    return lines, cd_turns
 
 
 def _tick_battle_heal_cooldown(battle: Battle, user_id: int) -> Optional[int]:
@@ -2184,6 +2488,157 @@ def _tick_battle_heal_cooldown(battle: Battle, user_id: int) -> Optional[int]:
         return 0
     battle.heal_cooldown[user_id] = new_cd
     return new_cd
+
+
+def _capture_battle_full_snapshot(battle: Battle, *user_ids: int) -> dict:
+    """Снимает HP/in_battle указанных юзеров + полный snapshot pending_attacks/heal_cooldown/heal_hot.
+
+    Используется для отката при рерролле действий в командном бою."""
+    chars_snap: dict[int, dict] = {}
+    for uid in set(user_ids):
+        char_name = battle.char_by_user.get(uid)
+        ch = get_chars(uid).get(char_name) if char_name else None
+        if ch is not None:
+            chars_snap[uid] = {"hp": ch.current_hp, "in_battle": ch.in_battle}
+    return {
+        "pending_attacks": {k: dict(v) for k, v in battle.pending_attacks.items()},
+        "heal_cooldown": dict(battle.heal_cooldown),
+        "heal_hot": {k: dict(v) for k, v in battle.heal_hot.items()},
+        "chars": chars_snap,
+    }
+
+
+def _restore_battle_full_snapshot(battle: Battle, snapshot: dict) -> None:
+    battle.pending_attacks.clear()
+    battle.pending_attacks.update({k: dict(v) for k, v in snapshot["pending_attacks"].items()})
+    battle.heal_cooldown.clear()
+    battle.heal_cooldown.update(snapshot["heal_cooldown"])
+    battle.heal_hot.clear()
+    battle.heal_hot.update({k: dict(v) for k, v in snapshot["heal_hot"].items()})
+    for uid, char_data in snapshot["chars"].items():
+        char_name = battle.char_by_user.get(uid)
+        ch = get_chars(uid).get(char_name) if char_name else None
+        if ch is not None:
+            ch.current_hp = char_data["hp"]
+            ch.in_battle = bool(char_data["in_battle"])
+
+
+def _build_battle_resolve_result(
+    battle: Battle,
+    responder_id: int,
+    response_kind: str,
+    response_roll: int,
+    response_cap: int,
+) -> tuple[list[str], list[tuple[int, Character]]]:
+    """Применяет резолв pending-атаки в командном бою. Возвращает (lines, knocked_targets).
+
+    Если pending не существует — пустой список."""
+    pending = battle.pending_attacks.pop(responder_id, None)
+    if pending is None:
+        return [], []
+    initiator_id = pending["attacker_id"]
+    pending_cap = pending["cap"]
+    pending_roll = pending["roll"]
+
+    initiator_char_name = battle.char_by_user.get(initiator_id)
+    initiator_ch = (
+        get_chars(initiator_id).get(initiator_char_name)
+        if initiator_char_name
+        else None
+    )
+    responder_char_name = battle.char_by_user.get(responder_id)
+    responder_ch = (
+        get_chars(responder_id).get(responder_char_name)
+        if responder_char_name
+        else None
+    )
+
+    initiator_name = html.escape(display_name(initiator_id))
+    responder_name = html.escape(display_name(responder_id))
+
+    init_label = f"⚔️ <b>{initiator_name}</b> атака"
+    if response_kind == "defend":
+        resp_label = f"🛡 <b>{responder_name}</b> защита"
+    elif response_kind == "attack":
+        resp_label = f"⚔️ <b>{responder_name}</b> контр-атака"
+    else:
+        resp_label = f"🩹 <b>{responder_name}</b> хил-ответ"
+
+    lines = [
+        f"{init_label}: 🎲 <b>{pending_roll}</b> (из 1–{pending_cap})",
+        f"{resp_label}: 🎲 <b>{response_roll}</b> (из 1–{response_cap})",
+    ]
+
+    pending_wins = pending_roll > response_roll
+    response_wins = response_roll > pending_roll
+    knocked_targets: list[tuple[int, Character]] = []
+
+    if pending_wins and initiator_ch is not None and responder_ch is not None:
+        base_pct, verdict = _team_battle_damage_pct(initiator_ch, pending_roll)
+        reduction_pp = _hp_advantage_reduction(initiator_ch.max_hp, responder_ch.max_hp)
+        eff = max(1, base_pct - reduction_pp)
+        dmg = max(1, (responder_ch.max_hp * eff) // 100)
+        before = responder_ch.current_hp
+        responder_ch.current_hp = max(0, before - dmg)
+        red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
+        lines.append(
+            f"💥 <b>{initiator_name}</b> попал — {verdict}{red_note}. "
+            f"{html.escape(responder_ch.name)}: {before} → "
+            f"<b>{responder_ch.current_hp}</b>/{responder_ch.max_hp} (−{dmg})."
+        )
+        if responder_ch.current_hp <= 0:
+            responder_ch.in_battle = False
+            knocked_targets.append((responder_id, responder_ch))
+        if response_kind == "attack":
+            lines.append(f"⚠️ Контр-атака <b>{responder_name}</b> прервана.")
+        elif response_kind == "heal":
+            lines.append(f"⚠️ Хил <b>{responder_name}</b> прерван.")
+    elif response_wins:
+        lines.append(f"➡️ Атака <b>{initiator_name}</b> промахнулась.")
+        if response_kind == "attack" and initiator_ch is not None and responder_ch is not None:
+            base_pct, verdict = _team_battle_damage_pct(responder_ch, response_roll)
+            reduction_pp = _hp_advantage_reduction(responder_ch.max_hp, initiator_ch.max_hp)
+            eff = max(1, base_pct - reduction_pp)
+            dmg = max(1, (initiator_ch.max_hp * eff) // 100)
+            before = initiator_ch.current_hp
+            initiator_ch.current_hp = max(0, before - dmg)
+            red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
+            lines.append(
+                f"💥 <b>{responder_name}</b> в ответ — {verdict}{red_note}. "
+                f"{html.escape(initiator_ch.name)}: {before} → "
+                f"<b>{initiator_ch.current_hp}</b>/{initiator_ch.max_hp} (−{dmg})."
+            )
+            if initiator_ch.current_hp <= 0:
+                initiator_ch.in_battle = False
+                knocked_targets.append((initiator_id, initiator_ch))
+        elif response_kind == "heal" and responder_ch is not None:
+            heal_pct, hverdict = _team_battle_heal_pct(responder_ch, response_roll)
+            heal_amt = max(1, (responder_ch.max_hp * heal_pct) // 100)
+            before = responder_ch.current_hp
+            responder_ch.current_hp = min(responder_ch.max_hp, before + heal_amt)
+            lines.append(
+                f"✅ <b>{responder_name}</b> {hverdict}. "
+                f"{html.escape(responder_ch.name)}: {before} → "
+                f"<b>{responder_ch.current_hp}</b>/{responder_ch.max_hp} "
+                f"(+{responder_ch.current_hp - before})."
+            )
+    else:
+        lines.append(f"⚖️ Ничья — атака <b>{initiator_name}</b> мимо.")
+        if response_kind == "attack":
+            lines.append(f"⚖️ Контр-атака <b>{responder_name}</b> мимо.")
+        elif response_kind == "heal":
+            lines.append(f"⚖️ Хил <b>{responder_name}</b> не сработал.")
+
+    if response_kind != "heal":
+        cd_after = _tick_battle_heal_cooldown(battle, responder_id)
+        if cd_after == 0:
+            lines.append(f"✅ <b>{responder_name}</b>: КД лечения откатился.")
+        elif cd_after is not None:
+            lines.append(
+                f"⏳ <b>{responder_name}</b>: КД лечения теперь {cd_after} ход(а)."
+            )
+
+    return lines, knocked_targets
 
 
 async def _cmd_attack_team_battle(
@@ -2255,6 +2710,13 @@ async def _cmd_attack_team_battle(
         )
         return
 
+    # Новое действие в бою — прежние реролл-кнопки невалидны.
+    _invalidate_battle_rerolls(battle.battle_id)
+
+    # Снимок ДО мутаций — для возможного реролла.
+    prev_pending = dict(existing) if existing is not None else None
+    prev_cooldown = battle.heal_cooldown.get(user_id)
+
     # Запоминаем pending и ждём ответа цели.
     battle.pending_attacks[tgt_id] = {
         "attacker_id": user_id,
@@ -2268,24 +2730,67 @@ async def _cmd_attack_team_battle(
     atk_char_html = html.escape(attacker_ch.name)
     tgt_label = html.escape(tgt_label_raw or display_name(tgt_id))
     tgt_char_html = html.escape(target_ch.name)
+    text = _battle_pending_attack_text(
+        atk_label, atk_char_html, tgt_label, tgt_char_html, roll, cap, cd_after
+    )
+
+    token: Optional[str] = None
+    kb: Optional[InlineKeyboardMarkup] = None
+    if _can_reroll(user_id):
+        token = _new_reroll_token()
+        _REROLLS[token] = {
+            "kind": "battle_pending_attack",
+            "user_id": user_id,
+            "count": 0,
+            "battle_id": battle.battle_id,
+            "cap": cap,
+            "tgt_id": tgt_id,
+            "atk_label": atk_label,
+            "atk_char_html": atk_char_html,
+            "tgt_label": tgt_label,
+            "tgt_char_html": tgt_char_html,
+            "snapshot": {
+                "prev_pending": prev_pending,
+                "prev_cooldown": prev_cooldown,
+            },
+        }
+        _gc_rerolls()
+        kb = _reroll_kb(token, 0)
+
+    try:
+        sent = await bot.send_message(battle.chat_id, text, reply_markup=kb)
+        if token is not None:
+            _REROLLS[token]["chat_id"] = sent.chat.id
+            _REROLLS[token]["message_id"] = sent.message_id
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("team-battle attack notice: %s", exc)
+        if token is not None:
+            _REROLLS.pop(token, None)
+    await _refresh_battle_message(bot, battle)
+
+
+def _battle_pending_attack_text(
+    atk_label: str,
+    atk_char_html: str,
+    tgt_label: str,
+    tgt_char_html: str,
+    roll: int,
+    cap: int,
+    cd_after: Optional[int],
+) -> str:
     cd_note = ""
     if cd_after == 0:
         cd_note = "\n✅ КД лечения откатился."
     elif cd_after is not None:
         cd_note = f"\n⏳ КД лечения теперь: <b>{cd_after}</b> ход(а)."
-    try:
-        await bot.send_message(
-            battle.chat_id,
-            f"⚔️ <b>{atk_label}</b> ({atk_char_html}) атакует "
-            f"<b>{tgt_label}</b> ({tgt_char_html}) — 🎲 бот кинул <b>{roll}</b> "
-            f"из 1–{cap}.\n"
-            f"🛡 <b>{tgt_label}</b> — ответь любым: "
-            f"<code>/defend &lt;макс&gt;</code>, <code>/attack &lt;макс&gt;</code> "
-            f"(контр) или <code>/heal &lt;макс&gt;</code> (хил-ответ).{cd_note}",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("team-battle attack notice: %s", exc)
-    await _refresh_battle_message(bot, battle)
+    return (
+        f"⚔️ <b>{atk_label}</b> ({atk_char_html}) атакует "
+        f"<b>{tgt_label}</b> ({tgt_char_html}) — 🎲 бот кинул <b>{roll}</b> "
+        f"из 1–{cap}.\n"
+        f"🛡 <b>{tgt_label}</b> — ответь любым: "
+        f"<code>/defend &lt;макс&gt;</code>, <code>/attack &lt;макс&gt;</code> "
+        f"(контр) или <code>/heal &lt;макс&gt;</code> (хил-ответ).{cd_note}"
+    )
 
 
 async def _resolve_battle_pending(
@@ -2301,121 +2806,49 @@ async def _resolve_battle_pending(
     response_kind: 'defend' | 'attack' | 'heal'. У кого больше ролл — тот сработал.
     Ничья — оба промахнулись. Урон/хил применяются по правилам командного боя
     (полный/слабый в зависимости от ролла и класса)."""
-    pending = battle.pending_attacks.pop(responder_id, None)
+    pending = battle.pending_attacks.get(responder_id)
     if pending is None:
         return
     initiator_id = pending["attacker_id"]
-    pending_cap = pending["cap"]
-    pending_roll = pending["roll"]
 
-    initiator_char_name = battle.char_by_user.get(initiator_id)
-    initiator_ch = (
-        get_chars(initiator_id).get(initiator_char_name)
-        if initiator_char_name
-        else None
+    # Новое действие — старые реролл-кнопки этого боя становятся неактуальны.
+    _invalidate_battle_rerolls(battle.battle_id)
+
+    snapshot = _capture_battle_full_snapshot(battle, initiator_id, responder_id)
+    lines, knocked_targets = _build_battle_resolve_result(
+        battle, responder_id, response_kind, response_roll, response_cap
     )
-    responder_char_name = battle.char_by_user.get(responder_id)
-    responder_ch = (
-        get_chars(responder_id).get(responder_char_name)
-        if responder_char_name
-        else None
-    )
-
-    initiator_name = html.escape(display_name(initiator_id))
-    responder_name = html.escape(display_name(responder_id))
-
-    init_label = f"⚔️ <b>{initiator_name}</b> атака"
-    if response_kind == "defend":
-        resp_label = f"🛡 <b>{responder_name}</b> защита"
-    elif response_kind == "attack":
-        resp_label = f"⚔️ <b>{responder_name}</b> контр-атака"
-    else:
-        resp_label = f"🩹 <b>{responder_name}</b> хил-ответ"
-
-    lines = [
-        f"{init_label}: 🎲 <b>{pending_roll}</b> (из 1–{pending_cap})",
-        f"{resp_label}: 🎲 <b>{response_roll}</b> (из 1–{response_cap})",
-    ]
-
-    pending_wins = pending_roll > response_roll
-    response_wins = response_roll > pending_roll
-    knocked_targets: list[tuple[int, Character]] = []
-
-    if pending_wins and initiator_ch is not None and responder_ch is not None:
-        # Удар инициатора прошёл.
-        base_pct, verdict = _team_battle_damage_pct(initiator_ch, pending_roll)
-        reduction_pp = _hp_advantage_reduction(initiator_ch.max_hp, responder_ch.max_hp)
-        eff = max(1, base_pct - reduction_pp)
-        dmg = max(1, (responder_ch.max_hp * eff) // 100)
-        before = responder_ch.current_hp
-        responder_ch.current_hp = max(0, before - dmg)
-        red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
-        lines.append(
-            f"💥 <b>{initiator_name}</b> попал — {verdict}{red_note}. "
-            f"{html.escape(responder_ch.name)}: {before} → "
-            f"<b>{responder_ch.current_hp}</b>/{responder_ch.max_hp} (−{dmg})."
-        )
-        if responder_ch.current_hp <= 0:
-            responder_ch.in_battle = False
-            knocked_targets.append((responder_id, responder_ch))
-        if response_kind == "attack":
-            lines.append(f"⚠️ Контр-атака <b>{responder_name}</b> прервана.")
-        elif response_kind == "heal":
-            lines.append(f"⚠️ Хил <b>{responder_name}</b> прерван.")
-    elif response_wins:
-        lines.append(f"➡️ Атака <b>{initiator_name}</b> промахнулась.")
-        if response_kind == "attack" and initiator_ch is not None and responder_ch is not None:
-            base_pct, verdict = _team_battle_damage_pct(responder_ch, response_roll)
-            reduction_pp = _hp_advantage_reduction(responder_ch.max_hp, initiator_ch.max_hp)
-            eff = max(1, base_pct - reduction_pp)
-            dmg = max(1, (initiator_ch.max_hp * eff) // 100)
-            before = initiator_ch.current_hp
-            initiator_ch.current_hp = max(0, before - dmg)
-            red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
-            lines.append(
-                f"💥 <b>{responder_name}</b> в ответ — {verdict}{red_note}. "
-                f"{html.escape(initiator_ch.name)}: {before} → "
-                f"<b>{initiator_ch.current_hp}</b>/{initiator_ch.max_hp} (−{dmg})."
-            )
-            if initiator_ch.current_hp <= 0:
-                initiator_ch.in_battle = False
-                knocked_targets.append((initiator_id, initiator_ch))
-        elif response_kind == "heal" and responder_ch is not None:
-            # Само-хил по тому же распределению что и /heal в команд. бою.
-            heal_pct, hverdict = _team_battle_heal_pct(responder_ch, response_roll)
-            heal_amt = max(1, (responder_ch.max_hp * heal_pct) // 100)
-            before = responder_ch.current_hp
-            responder_ch.current_hp = min(responder_ch.max_hp, before + heal_amt)
-            lines.append(
-                f"✅ <b>{responder_name}</b> {hverdict}. "
-                f"{html.escape(responder_ch.name)}: {before} → "
-                f"<b>{responder_ch.current_hp}</b>/{responder_ch.max_hp} "
-                f"(+{responder_ch.current_hp - before})."
-            )
-    else:
-        lines.append(f"⚖️ Ничья — атака <b>{initiator_name}</b> мимо.")
-        if response_kind == "attack":
-            lines.append(f"⚖️ Контр-атака <b>{responder_name}</b> мимо.")
-        elif response_kind == "heal":
-            lines.append(f"⚖️ Хил <b>{responder_name}</b> не сработал.")
-
-    # Любое действие в бою (включая ответ на pending) тикает КД лечения у того,
-    # кто это действие совершил. Для /heal-ответа КД не тикаем тут — это сам хил,
-    # его КД управляется логикой /heal (cmd_heal/_cmd_heal_team_battle).
-    if response_kind != "heal":
-        cd_after = _tick_battle_heal_cooldown(battle, responder_id)
-        if cd_after == 0:
-            lines.append(f"✅ <b>{responder_name}</b>: КД лечения откатился.")
-        elif cd_after is not None:
-            lines.append(
-                f"⏳ <b>{responder_name}</b>: КД лечения теперь {cd_after} ход(а)."
-            )
-
+    if not lines:
+        return
     save_state()
+
+    text = "\n".join(lines)
+    token: Optional[str] = None
+    kb: Optional[InlineKeyboardMarkup] = None
+    if not knocked_targets and _can_reroll(responder_id):
+        token = _new_reroll_token()
+        _REROLLS[token] = {
+            "kind": "battle_resolve",
+            "user_id": responder_id,
+            "count": 0,
+            "battle_id": battle.battle_id,
+            "cap": response_cap,
+            "response_kind": response_kind,
+            "snapshot": snapshot,
+            "initiator_id": initiator_id,
+        }
+        _gc_rerolls()
+        kb = _reroll_kb(token, 0)
+
     try:
-        await bot.send_message(battle.chat_id, "\n".join(lines))
+        sent = await bot.send_message(battle.chat_id, text, reply_markup=kb)
+        if token is not None:
+            _REROLLS[token]["chat_id"] = sent.chat.id
+            _REROLLS[token]["message_id"] = sent.message_id
     except Exception as exc:  # noqa: BLE001
         logging.warning("battle resolve pending: %s", exc)
+        if token is not None:
+            _REROLLS.pop(token, None)
 
     if knocked_targets:
         for uid, ch in knocked_targets:
@@ -2484,21 +2917,50 @@ async def cmd_heal(message: Message, command: CommandObject, bot: Bot) -> None:
 
     healer_name = html.escape(display_name(user_id))
     is_healer = healer_ch.char_class == CharClass.HEALER
+    healer_char_html = html.escape(healer_ch.name)
+
+    # Новое действие — старые кнопки реролла дуэли неактуальны.
+    _invalidate_duel_rerolls(duel.duel_id)
 
     if is_healer:
-        # Лекарь лечится соло — без pending.
+        # Лекарь лечится соло — без pending. Снимок до хила — для возможного реролла.
+        hp_before_action = healer_ch.current_hp
+        in_battle_before = healer_ch.in_battle
         heal_amt, before, verdict = _apply_heal_self(healer_ch, heal_roll)
         save_state()
+
+        text = _duel_healer_self_text(
+            healer_name, healer_ch.name, heal_roll, heal_cap, verdict, before, healer_ch
+        )
+        token: Optional[str] = None
+        kb: Optional[InlineKeyboardMarkup] = None
+        if _can_reroll(user_id):
+            token = _new_reroll_token()
+            _REROLLS[token] = {
+                "kind": "duel_heal_self",
+                "user_id": user_id,
+                "count": 0,
+                "duel_id": duel.duel_id,
+                "cap": heal_cap,
+                "healer_name": healer_name,
+                "healer_char": healer_ch.name,
+                "snapshot": {
+                    "healer_hp": hp_before_action,
+                    "healer_in_battle": in_battle_before,
+                },
+            }
+            _gc_rerolls()
+            kb = _reroll_kb(token, 0)
+
         try:
-            await bot.send_message(
-                duel.chat_id,
-                f"🌿 <b>{healer_name}</b> (Лекарь) лечение: 🎲 <b>{heal_roll}</b> "
-                f"из 1–{heal_cap} — {verdict}.\n"
-                f"❤️ {html.escape(healer_ch.name)}: {before} → "
-                f"<b>{healer_ch.current_hp}</b>/{healer_ch.max_hp} (+{healer_ch.current_hp - before}).",
-            )
+            sent = await bot.send_message(duel.chat_id, text, reply_markup=kb)
+            if token is not None:
+                _REROLLS[token]["chat_id"] = sent.chat.id
+                _REROLLS[token]["message_id"] = sent.message_id
         except Exception as exc:  # noqa: BLE001
             logging.warning("heal (healer): %s", exc)
+            if token is not None:
+                _REROLLS.pop(token, None)
         await _refresh_duel_message(bot, duel)
         return
 
@@ -2512,18 +2974,65 @@ async def cmd_heal(message: Message, command: CommandObject, bot: Bot) -> None:
     duel.pending_attack_roll = heal_roll
 
     opp_name = html.escape(display_name(opp_id))
+    healer_class_label = CLASS_LABELS[healer_ch.char_class]
+    text = _duel_pending_heal_text(healer_name, healer_class_label, heal_roll, heal_cap, opp_name)
+    token: Optional[str] = None
+    kb: Optional[InlineKeyboardMarkup] = None
+    if _can_reroll(user_id):
+        token = _new_reroll_token()
+        _REROLLS[token] = {
+            "kind": "duel_pending_heal",
+            "user_id": user_id,
+            "count": 0,
+            "duel_id": duel.duel_id,
+            "cap": heal_cap,
+            "healer_name": healer_name,
+            "healer_class_label": healer_class_label,
+            "opp_name": opp_name,
+        }
+        _gc_rerolls()
+        kb = _reroll_kb(token, 0)
+
     try:
-        await bot.send_message(
-            duel.chat_id,
-            f"🩹 <b>{healer_name}</b> ({CLASS_LABELS[healer_ch.char_class]}) "
-            f"пытается полечиться — 🎲 бот кинул <b>{heal_roll}</b> из 1–{heal_cap}.\n"
-            f"🛡 <b>{opp_name}</b> — ответь любым: "
-            f"<code>/defend &lt;макс&gt;</code>, <code>/attack &lt;макс&gt;</code> или "
-            f"<code>/heal &lt;макс&gt;</code>.",
-        )
+        sent = await bot.send_message(duel.chat_id, text, reply_markup=kb)
+        if token is not None:
+            _REROLLS[token]["chat_id"] = sent.chat.id
+            _REROLLS[token]["message_id"] = sent.message_id
     except Exception as exc:  # noqa: BLE001
         logging.warning("heal (non-healer pending): %s", exc)
+        if token is not None:
+            _REROLLS.pop(token, None)
     await _refresh_duel_message(bot, duel)
+
+
+def _duel_healer_self_text(
+    healer_name: str,
+    healer_char_name: str,
+    heal_roll: int,
+    heal_cap: int,
+    verdict: str,
+    before: int,
+    healer_ch: Character,
+) -> str:
+    return (
+        f"🌿 <b>{healer_name}</b> (Лекарь) лечение: 🎲 <b>{heal_roll}</b> "
+        f"из 1–{heal_cap} — {verdict}.\n"
+        f"❤️ {html.escape(healer_char_name)}: {before} → "
+        f"<b>{healer_ch.current_hp}</b>/{healer_ch.max_hp} "
+        f"(+{healer_ch.current_hp - before})."
+    )
+
+
+def _duel_pending_heal_text(
+    healer_name: str, healer_class_label: str, heal_roll: int, heal_cap: int, opp_name: str
+) -> str:
+    return (
+        f"🩹 <b>{healer_name}</b> ({healer_class_label}) "
+        f"пытается полечиться — 🎲 бот кинул <b>{heal_roll}</b> из 1–{heal_cap}.\n"
+        f"🛡 <b>{opp_name}</b> — ответь любым: "
+        f"<code>/defend &lt;макс&gt;</code>, <code>/attack &lt;макс&gt;</code> или "
+        f"<code>/heal &lt;макс&gt;</code>."
+    )
 
 
 @router.message(Command("roll"))
@@ -3196,6 +3705,13 @@ async def cmd_help(message: Message) -> None:
         "/jesus — воскресить любого без сознания персонажа (выбор из меню; "
         "если задан OWNER_ID — только владелец)\n"
         "/help — это сообщение\n\n"
+        "<b>🎲 Реролл (опция владельца)</b>\n"
+        f"На сообщениях с броском (/attack, /defend, /heal в дуэли и /buttle) "
+        f"у владельца и тех, кому он выдал право, появляется кнопка "
+        f"«🎲 Перебросить» — до {MAX_REROLLS_PER_USE} раз на одно действие, "
+        f"только свой бросок. Команды владельца: "
+        f"<code>/grant_reroll @user</code>, <code>/revoke_reroll @user</code>, "
+        f"<code>/reroll_list</code>.\n\n"
         "<b>⚔️ Классы и проценты от макс. ХП</b>\n"
         f"{CLASS_LABELS[CharClass.ATTACKER]}\n"
         f"    🩸 урон: −{atk['damage_pct']}%   🩹 лечение: +{atk['heal_pct']}%\n"
@@ -3436,6 +3952,441 @@ async def on_jesus_choice(cb: CallbackQuery) -> None:
         f"Чудотворец: {healer}"
     )
     await cb.answer("Воскрешено!", show_alert=False)
+
+
+# ---------------------------------------------------------------------------
+# Реролл: команды владельца + callback кнопки «🎲 Перебросить»
+# ---------------------------------------------------------------------------
+
+
+def _extract_target_user_id(message: Message) -> Optional[int]:
+    """Достаёт целевого юзера из команды: либо @username, либо reply, либо аргумент-число."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+
+    text = (message.text or message.caption or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    arg = parts[1].strip()
+    if arg.startswith("@"):
+        uname = arg[1:].lstrip("@").lower()
+        return username_to_id.get(uname)
+    if arg.isdigit():
+        try:
+            return int(arg)
+        except ValueError:
+            return None
+    return None
+
+
+@router.message(Command("grant_reroll"))
+async def cmd_grant_reroll(message: Message) -> None:
+    remember_user(message.from_user)
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.answer("⛔️ Команда /grant_reroll доступна только владельцу бота.")
+        return
+    tgt = _extract_target_user_id(message)
+    if tgt is None:
+        await message.answer(
+            "Кому выдать право реролла? Используй: <code>/grant_reroll @username</code> "
+            "или ответом на сообщение, или <code>/grant_reroll &lt;user_id&gt;</code>.\n"
+            "<i>Игрок должен хотя бы раз написать боту /start, чтобы его username был известен.</i>"
+        )
+        return
+    if tgt == OWNER_ID:
+        await message.answer("Владелец и так может реролить — отдельный grant не нужен.")
+        return
+    if tgt in reroll_users:
+        await message.answer(
+            f"✔️ <b>{html.escape(display_name(tgt))}</b> уже имеет право реролла."
+        )
+        return
+    reroll_users.add(tgt)
+    save_state()
+    await message.answer(
+        f"✅ Выдан реролл: <b>{html.escape(display_name(tgt))}</b> "
+        f"может перебрасывать свои броски (до {MAX_REROLLS_PER_USE} раз)."
+    )
+
+
+@router.message(Command("revoke_reroll"))
+async def cmd_revoke_reroll(message: Message) -> None:
+    remember_user(message.from_user)
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.answer("⛔️ Команда /revoke_reroll доступна только владельцу бота.")
+        return
+    tgt = _extract_target_user_id(message)
+    if tgt is None:
+        await message.answer(
+            "У кого забрать право реролла? Используй: <code>/revoke_reroll @username</code> "
+            "или ответом на сообщение, или <code>/revoke_reroll &lt;user_id&gt;</code>."
+        )
+        return
+    if tgt == OWNER_ID:
+        await message.answer("Право владельца забрать нельзя.")
+        return
+    if tgt not in reroll_users:
+        await message.answer(
+            f"<b>{html.escape(display_name(tgt))}</b> и так без права реролла."
+        )
+        return
+    reroll_users.discard(tgt)
+    save_state()
+    await message.answer(
+        f"🚫 Реролл отозван у <b>{html.escape(display_name(tgt))}</b>."
+    )
+
+
+@router.message(Command("reroll_list"))
+async def cmd_reroll_list(message: Message) -> None:
+    remember_user(message.from_user)
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.answer("⛔️ Список реролл-юзеров видит только владелец.")
+        return
+    if not reroll_users:
+        await message.answer(
+            "Список пуст — реролл-кнопка есть только у тебя (владельца). "
+            "Чтобы выдать кому-то: <code>/grant_reroll @username</code>."
+        )
+        return
+    lines = ["<b>🎲 С правом реролла:</b>"]
+    for uid in sorted(reroll_users):
+        lines.append(f"• {html.escape(display_name(uid))} (<code>{uid}</code>)")
+    await message.answer("\n".join(lines))
+
+
+@router.callback_query(F.data.startswith("reroll:"))
+async def on_reroll(cb: CallbackQuery, bot: Bot) -> None:
+    remember_user(cb.from_user)
+    parts = (cb.data or "").split(":", 1)
+    if len(parts) != 2:
+        await cb.answer()
+        return
+    token = parts[1]
+    info = _REROLLS.get(token)
+    if info is None:
+        await cb.answer("Реролл больше недоступен (состояние изменилось).", show_alert=True)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    user_id = info["user_id"]
+    if cb.from_user.id != user_id:
+        await cb.answer("Можно реролить только свой бросок.", show_alert=True)
+        return
+
+    if info["count"] >= MAX_REROLLS_PER_USE:
+        await cb.answer(
+            f"Лимит реролла исчерпан ({MAX_REROLLS_PER_USE} раза).",
+            show_alert=True,
+        )
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    if not _can_reroll(cb.from_user.id):
+        await cb.answer("Право реролла было отозвано.", show_alert=True)
+        _REROLLS.pop(token, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    kind = info["kind"]
+    cap = info["cap"]
+    new_roll = random.randint(1, cap)
+
+    try:
+        if kind == "duel_pending_attack":
+            await _do_reroll_duel_pending_attack(bot, cb, token, info, new_roll)
+        elif kind == "duel_pending_heal":
+            await _do_reroll_duel_pending_heal(bot, cb, token, info, new_roll)
+        elif kind == "duel_heal_self":
+            await _do_reroll_duel_heal_self(bot, cb, token, info, new_roll)
+        elif kind == "duel_resolve":
+            await _do_reroll_duel_resolve(bot, cb, token, info, new_roll)
+        elif kind == "battle_pending_attack":
+            await _do_reroll_battle_pending_attack(bot, cb, token, info, new_roll)
+        elif kind == "battle_resolve":
+            await _do_reroll_battle_resolve(bot, cb, token, info, new_roll)
+        elif kind == "battle_heal_cd_tick":
+            await _do_reroll_battle_heal_cd_tick(bot, cb, token, info, new_roll)
+        elif kind == "battle_heal_apply":
+            await _do_reroll_battle_heal_apply(bot, cb, token, info, new_roll)
+        else:
+            await cb.answer("Неизвестный тип реролла.", show_alert=True)
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("reroll handler %s: %s", kind, exc)
+        try:
+            await cb.answer("Ошибка реролла, см. логи.", show_alert=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _safe_edit(bot: Bot, info: dict, text: str, kb: Optional[InlineKeyboardMarkup]) -> None:
+    chat_id = info.get("chat_id")
+    message_id = info.get("message_id")
+    if chat_id is None or message_id is None:
+        return
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=kb,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("reroll edit: %s", exc)
+
+
+async def _do_reroll_duel_pending_attack(bot, cb, token, info, new_roll):
+    duel = duels.get(info["duel_id"])
+    if duel is None or duel.status != DuelStatus.ACTIVE:
+        await cb.answer("Дуэль уже не активна — реролл недоступен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    if duel.pending_attacker_id != info["user_id"] or duel.pending_kind != "attack":
+        await cb.answer("Состояние дуэли изменилось — реролл невозможен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    duel.pending_attack_roll = new_roll
+    save_state()
+    info["count"] += 1
+    text = _duel_pending_attack_text(
+        info["atk_name"], info["atk_char"], new_roll, info["cap"], info["def_name"]
+    )
+    kb = _reroll_kb(token, info["count"])
+    await _safe_edit(bot, info, text, kb)
+    await cb.answer(f"Новый бросок: {new_roll}")
+
+
+async def _do_reroll_duel_pending_heal(bot, cb, token, info, new_roll):
+    duel = duels.get(info["duel_id"])
+    if duel is None or duel.status != DuelStatus.ACTIVE:
+        await cb.answer("Дуэль уже не активна.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    if duel.pending_attacker_id != info["user_id"] or duel.pending_kind != "heal_resist":
+        await cb.answer("Состояние дуэли изменилось.", show_alert=True)
+        _REROLLS.pop(token, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    duel.pending_attack_roll = new_roll
+    save_state()
+    info["count"] += 1
+    text = _duel_pending_heal_text(
+        info["healer_name"], info["healer_class_label"], new_roll, info["cap"], info["opp_name"]
+    )
+    kb = _reroll_kb(token, info["count"])
+    await _safe_edit(bot, info, text, kb)
+    await cb.answer(f"Новый бросок: {new_roll}")
+
+
+async def _do_reroll_duel_heal_self(bot, cb, token, info, new_roll):
+    duel = duels.get(info["duel_id"])
+    if duel is None or duel.status != DuelStatus.ACTIVE:
+        await cb.answer("Дуэль уже не активна.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    healer_ch = _duel_char_of(duel, info["user_id"])
+    if healer_ch is None:
+        await cb.answer("Персонаж не найден.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    snap = info["snapshot"]
+    # Откатываем ХП к состоянию ДО хила.
+    healer_ch.current_hp = snap["healer_hp"]
+    healer_ch.in_battle = bool(snap["healer_in_battle"])
+    heal_amt, before, verdict = _apply_heal_self(healer_ch, new_roll)
+    save_state()
+    info["count"] += 1
+    text = _duel_healer_self_text(
+        info["healer_name"], info["healer_char"], new_roll, info["cap"], verdict, before, healer_ch
+    )
+    kb = _reroll_kb(token, info["count"])
+    await _safe_edit(bot, info, text, kb)
+    await _refresh_duel_message(bot, duel)
+    await cb.answer(f"Новый бросок: {new_roll}")
+
+
+async def _do_reroll_duel_resolve(bot, cb, token, info, new_roll):
+    duel = duels.get(info["duel_id"])
+    if duel is None or duel.status != DuelStatus.ACTIVE:
+        await cb.answer("Дуэль уже не активна — реролл недоступен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    snap = info["snapshot"]
+    # Если кто-то новый pending заинициализировал — реролл нельзя.
+    if duel.pending_kind is not None:
+        await cb.answer("Появилось новое действие — реролл невозможен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    _restore_duel_resolve_snapshot(duel, snap)
+    lines, knocked_out = _build_duel_resolve_result(
+        duel, info["response_kind"], new_roll, info["cap"], snap["responder_id"]
+    )
+    save_state()
+    info["count"] += 1
+    text = "\n".join(lines)
+    kb = _reroll_kb(token, info["count"]) if knocked_out is None else None
+    await _safe_edit(bot, info, text, kb)
+
+    if knocked_out is not None:
+        _REROLLS.pop(token, None)
+        await _handle_knockout(bot, duel, knocked_out)
+
+    await _refresh_duel_message(bot, duel)
+    await cb.answer(f"Новый бросок: {new_roll}")
+
+
+async def _do_reroll_battle_pending_attack(bot, cb, token, info, new_roll):
+    battle = battles.get(info["battle_id"])
+    if battle is None or battle.status != BattleStatus.ACTIVE:
+        await cb.answer("Бой уже не активен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    pending = battle.pending_attacks.get(info["tgt_id"])
+    if pending is None or pending.get("attacker_id") != info["user_id"]:
+        await cb.answer("Состояние боя изменилось — реролл невозможен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    pending["roll"] = new_roll
+    pending["cap"] = info["cap"]
+    save_state()
+    info["count"] += 1
+    # cd_after сохранилось в первоначальном сообщении и не меняется при рерролле.
+    # Восстановим из текста? Проще пересчитать: при первой отправке КД уже был стикан;
+    # повторно не тикаем, просто берём оставшийся.
+    cd_after = battle.heal_cooldown.get(info["user_id"])
+    text = _battle_pending_attack_text(
+        info["atk_label"], info["atk_char_html"], info["tgt_label"],
+        info["tgt_char_html"], new_roll, info["cap"], cd_after,
+    )
+    kb = _reroll_kb(token, info["count"])
+    await _safe_edit(bot, info, text, kb)
+    await cb.answer(f"Новый бросок: {new_roll}")
+
+
+async def _do_reroll_battle_resolve(bot, cb, token, info, new_roll):
+    battle = battles.get(info["battle_id"])
+    if battle is None or battle.status != BattleStatus.ACTIVE:
+        await cb.answer("Бой уже не активен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    snap = info["snapshot"]
+    _restore_battle_full_snapshot(battle, snap)
+    lines, knocked_targets = _build_battle_resolve_result(
+        battle, info["user_id"], info["response_kind"], new_roll, info["cap"]
+    )
+    save_state()
+    info["count"] += 1
+    text = "\n".join(lines)
+    kb = _reroll_kb(token, info["count"]) if not knocked_targets else None
+    await _safe_edit(bot, info, text, kb)
+
+    if knocked_targets:
+        _REROLLS.pop(token, None)
+        for uid, ch in knocked_targets:
+            battle.pending_attacks.pop(uid, None)
+            for tid, pinfo in list(battle.pending_attacks.items()):
+                if pinfo.get("attacker_id") == uid:
+                    battle.pending_attacks.pop(tid, None)
+
+    await _refresh_battle_message(bot, battle)
+    await _check_battle_progress(bot, battle)
+    await cb.answer(f"Новый бросок: {new_roll}")
+
+
+async def _do_reroll_battle_heal_cd_tick(bot, cb, token, info, new_roll):
+    battle = battles.get(info["battle_id"])
+    if battle is None or battle.status != BattleStatus.ACTIVE:
+        await cb.answer("Бой уже не активен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    snap = info["snapshot"]
+    _restore_battle_full_snapshot(battle, snap)
+
+    user_id = info["user_id"]
+    healer_char_name = battle.char_by_user.get(user_id)
+    healer_ch = get_chars(user_id).get(healer_char_name) if healer_char_name else None
+    if healer_ch is None:
+        await cb.answer("Персонаж не найден.", show_alert=True)
+        return
+    cd_left = battle.heal_cooldown.get(user_id, 0)
+    if cd_left <= 0:
+        # КД успело откатиться (теоретически — реролл после паузы). Нечего тикать.
+        await cb.answer("КД лечения уже откатился.", show_alert=True)
+        _REROLLS.pop(token, None)
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    lines, _hid, _hlabel = _battle_heal_cd_tick(
+        battle, info["healer_label"], healer_ch, new_roll, info["cap"],
+        cd_left, info["is_healer"], user_id,
+    )
+    save_state()
+    info["count"] += 1
+    text = "\n".join(lines)
+    kb = _reroll_kb(token, info["count"])
+    await _safe_edit(bot, info, text, kb)
+    await _refresh_battle_message(bot, battle)
+    await cb.answer(f"Новый бросок: {new_roll}")
+
+
+async def _do_reroll_battle_heal_apply(bot, cb, token, info, new_roll):
+    battle = battles.get(info["battle_id"])
+    if battle is None or battle.status != BattleStatus.ACTIVE:
+        await cb.answer("Бой уже не активен.", show_alert=True)
+        _REROLLS.pop(token, None)
+        return
+    snap = info["snapshot"]
+    _restore_battle_full_snapshot(battle, snap)
+
+    user_id = info["user_id"]
+    tgt_id = info["tgt_id"]
+    healer_char_name = battle.char_by_user.get(user_id)
+    healer_ch = get_chars(user_id).get(healer_char_name) if healer_char_name else None
+    target_char_name = battle.char_by_user.get(tgt_id)
+    target_ch = get_chars(tgt_id).get(target_char_name) if target_char_name else None
+    if healer_ch is None or target_ch is None:
+        await cb.answer("Персонажи не найдены.", show_alert=True)
+        return
+
+    lines, _cd_turns = _battle_heal_apply(
+        battle, info["healer_label"], healer_ch, target_ch, new_roll, info["cap"],
+        tgt_id, info["target_html"], info["target_char_html"], info["is_healer"], user_id,
+    )
+    save_state()
+    info["count"] += 1
+    text = "\n".join(lines)
+    kb = _reroll_kb(token, info["count"])
+    await _safe_edit(bot, info, text, kb)
+    await _refresh_battle_message(bot, battle)
+    await cb.answer(f"Новый бросок: {new_roll}")
 
 
 # ---------------------------------------------------------------------------
