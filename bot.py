@@ -1346,6 +1346,42 @@ def _hp_advantage_reduction(attacker_max_hp: int, defender_max_hp: Optional[int]
     diff = defender_max_hp - attacker_max_hp
     return min(HP_ADVANTAGE_MAX_REDUCTION, diff // HP_ADVANTAGE_STEP)
 
+
+# Бонус разрыва ролла: если бросок атакующего сильно превышает бросок защитника,
+# базовый процент урона подменяется на тарифный (20/25/30%).
+# Применяется к атаке в дуэли и в /buttle. Лечение не затрагивает.
+ROLL_GAP_TIERS: list[tuple[int, int]] = [
+    (1000, 30),
+    (800, 25),
+    (500, 20),
+]
+
+
+def _roll_gap_target_pct(attacker_roll: Optional[int], defender_roll: Optional[int]) -> Optional[int]:
+    """Если разрыв ролла даёт право на бонус, возвращает фиксированный % урона.
+    Иначе None (используется базовый %)."""
+    if attacker_roll is None or defender_roll is None:
+        return None
+    diff = attacker_roll - defender_roll
+    if diff < ROLL_GAP_TIERS[-1][0]:
+        return None
+    for threshold, pct in ROLL_GAP_TIERS:
+        if diff >= threshold:
+            return pct
+    return None
+
+
+def _resolve_starting_pct(base_pct: int, attacker_roll: Optional[int], defender_roll: Optional[int]) -> tuple[int, int]:
+    """Возвращает (starting_pct, gap_bonus_pp) c учётом бонуса разрыва ролла.
+
+    Если бонус разрыва даёт более высокий %, чем base_pct — стартовый %
+    повышается до тарифного, а gap_bonus_pp = разница в п.п. Иначе (base_pct, 0)."""
+    gap_pct = _roll_gap_target_pct(attacker_roll, defender_roll)
+    if gap_pct is not None and gap_pct > base_pct:
+        return gap_pct, gap_pct - base_pct
+    return base_pct, 0
+
+
 # ---------------------------------------------------------------------------
 # Дуэли
 # ---------------------------------------------------------------------------
@@ -1689,17 +1725,27 @@ def _clear_pending(duel: Duel) -> None:
 
 
 def _apply_attack_damage(
-    attacker_ch: Character, defender_ch: Character
+    attacker_ch: Character,
+    defender_ch: Character,
+    attacker_roll: Optional[int] = None,
+    defender_roll: Optional[int] = None,
 ) -> tuple[int, int, str]:
-    """Применяет урон к defender_ch.current_hp in-place. Возвращает (damage, before_hp, pct_label)."""
+    """Применяет урон к defender_ch.current_hp in-place. Возвращает (damage, before_hp, pct_label).
+
+    Если переданы attacker_roll и defender_roll и их разрыв ≥500 — базовый %
+    урона подменяется на тарифный (20/25/30%). Затем из стартового % вычитается
+    «броня» сильного защитника по max ОП. Минимум — 1%."""
     stats = CLASS_STATS[attacker_ch.char_class]
     base_pct = stats["damage_pct"]
+    starting_pct, gap_bonus = _resolve_starting_pct(base_pct, attacker_roll, defender_roll)
     reduction_pp = _hp_advantage_reduction(attacker_ch.max_hp, defender_ch.max_hp)
-    effective_pct = max(1, base_pct - reduction_pp)
+    effective_pct = max(1, starting_pct - reduction_pp)
     damage = max(1, (defender_ch.max_hp * effective_pct) // 100)
     before = defender_ch.current_hp
     defender_ch.current_hp = max(0, before - damage)
     pct_label = f"{effective_pct}% от {defender_ch.max_hp} ОП"
+    if gap_bonus > 0:
+        pct_label += f" (+{gap_bonus} п.п. бонус за разрыв ролла)"
     if reduction_pp > 0:
         pct_label += f" (−{reduction_pp} п.п. за преимущество защитника)"
     return damage, before, pct_label
@@ -1843,7 +1889,9 @@ def _build_duel_resolve_result(
 
     if pending_wins:
         if pending_kind == "attack" and initiator_ch is not None and responder_ch is not None:
-            dmg, before, label = _apply_attack_damage(initiator_ch, responder_ch)
+            dmg, before, label = _apply_attack_damage(
+                initiator_ch, responder_ch, pending_roll, response_roll
+            )
             lines.append(
                 f"💥 <b>{initiator_name}</b> попал: урон <b>{dmg}</b> ({label}). "
                 f"{html.escape(responder_ch.name)}: {before} → "
@@ -1868,7 +1916,9 @@ def _build_duel_resolve_result(
         else:
             lines.append(f"❌ Лечение <b>{initiator_name}</b> не сработало.")
         if response_kind == "attack" and responder_ch is not None and initiator_ch is not None:
-            dmg, before, label = _apply_attack_damage(responder_ch, initiator_ch)
+            dmg, before, label = _apply_attack_damage(
+                responder_ch, initiator_ch, response_roll, pending_roll
+            )
             lines.append(
                 f"💥 <b>{responder_name}</b> в ответ: урон <b>{dmg}</b> ({label}). "
                 f"{html.escape(initiator_ch.name)}: {before} → "
@@ -2575,14 +2625,16 @@ def _build_battle_resolve_result(
 
     if pending_wins and initiator_ch is not None and responder_ch is not None:
         base_pct, verdict = _team_battle_damage_pct(initiator_ch, pending_roll)
+        starting_pct, gap_bonus = _resolve_starting_pct(base_pct, pending_roll, response_roll)
         reduction_pp = _hp_advantage_reduction(initiator_ch.max_hp, responder_ch.max_hp)
-        eff = max(1, base_pct - reduction_pp)
+        eff = max(1, starting_pct - reduction_pp)
         dmg = max(1, (responder_ch.max_hp * eff) // 100)
         before = responder_ch.current_hp
         responder_ch.current_hp = max(0, before - dmg)
+        gap_note = f" (+{gap_bonus} п.п. бонус за разрыв ролла)" if gap_bonus > 0 else ""
         red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
         lines.append(
-            f"💥 <b>{initiator_name}</b> попал — {verdict}{red_note}. "
+            f"💥 <b>{initiator_name}</b> попал — {verdict}{gap_note}{red_note}. "
             f"{html.escape(responder_ch.name)}: {before} → "
             f"<b>{responder_ch.current_hp}</b>/{responder_ch.max_hp} (−{dmg})."
         )
@@ -2597,14 +2649,16 @@ def _build_battle_resolve_result(
         lines.append(f"➡️ Атака <b>{initiator_name}</b> промахнулась.")
         if response_kind == "attack" and initiator_ch is not None and responder_ch is not None:
             base_pct, verdict = _team_battle_damage_pct(responder_ch, response_roll)
+            starting_pct, gap_bonus = _resolve_starting_pct(base_pct, response_roll, pending_roll)
             reduction_pp = _hp_advantage_reduction(responder_ch.max_hp, initiator_ch.max_hp)
-            eff = max(1, base_pct - reduction_pp)
+            eff = max(1, starting_pct - reduction_pp)
             dmg = max(1, (initiator_ch.max_hp * eff) // 100)
             before = initiator_ch.current_hp
             initiator_ch.current_hp = max(0, before - dmg)
+            gap_note = f" (+{gap_bonus} п.п. бонус за разрыв ролла)" if gap_bonus > 0 else ""
             red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
             lines.append(
-                f"💥 <b>{responder_name}</b> в ответ — {verdict}{red_note}. "
+                f"💥 <b>{responder_name}</b> в ответ — {verdict}{gap_note}{red_note}. "
                 f"{html.escape(initiator_ch.name)}: {before} → "
                 f"<b>{initiator_ch.current_hp}</b>/{initiator_ch.max_hp} (−{dmg})."
             )
@@ -3749,13 +3803,22 @@ async def cmd_help(message: Message) -> None:
         "<i>ХП не восстанавливается автоматически после боя — финальное значение "
         "сохраняется в карточке персонажа. Восстановить ХП можно вручную в /persona или "
         "через /jesus.</i>\n\n"
-        "<b>⚖️ Бонус сильному защитнику (только в дуэли)</b>\n"
+        "<b>⚖️ Бонус сильному защитнику</b>\n"
         f"Если у защитника max ОП больше, чем у атакующего, урон атакующего снижается "
         f"за каждые {HP_ADVANTAGE_STEP} ОП превышения на 1 п.п. "
         f"(потолок −{HP_ADVANTAGE_MAX_REDUCTION} п.п.).\n"
         f"Например: атак. 200 vs защ. 500 → разница 300 → −3 п.п. "
         f"(Боец бьёт 15−3 = 12% от max ОП защитника).\n"
-        "Минимум — 1% за попадание. На лечение не влияет."
+        "Минимум — 1% за попадание. На лечение не влияет.\n\n"
+        "<b>🎯 Бонус за разрыв ролла</b>\n"
+        "Если бросок атакующего сильно превышает бросок защитника, базовый % "
+        "урона повышается:\n"
+        "• разрыв 500–799 → 20% урона\n"
+        "• разрыв 800–999 → 25% урона\n"
+        "• разрыв ≥1000 → 30% урона\n"
+        "Меньше 500 — базовый % по классу (15% Боец / 5% Лекарь). "
+        "«Броня» защитника по max ОП вычитается из итогового % уже после "
+        "применения бонуса. Работает и в дуэли, и в /buttle. На лечение не влияет."
     )
 
 
