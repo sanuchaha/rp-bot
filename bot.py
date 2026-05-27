@@ -1330,17 +1330,17 @@ async def on_join_battle(cb: CallbackQuery) -> None:
     await cb.answer()
 
 
-# Бонус сильному защитнику: за каждые HP_ADVANTAGE_STEP ОП, на которые max ОП защитника
-# превышает max ОП атакующего, — −1 п.п. урона атакующего; но не больше HP_ADVANTAGE_MAX_REDUCTION п.п.
+# Бонус сильному защитнику: за каждые HP_ADVANTAGE_STEP ХП, на которые max ХП защитника
+# превышает max ХП атакующего, — −1% урона атакующего; но не больше HP_ADVANTAGE_MAX_REDUCTION%.
 HP_ADVANTAGE_STEP = 100
 HP_ADVANTAGE_MAX_REDUCTION = 5
 
 
 def _hp_advantage_reduction(attacker_max_hp: int, defender_max_hp: Optional[int]) -> int:
-    """Сколько п.п. вычесть из базового процента урона атакующего за преимущество защитника по ОП.
+    """Сколько процентов вычесть из базового процента урона атакующего за преимущество защитника по ХП.
 
-    Если max ОП защитника больше max ОП атакующего, то каждые 100 ОП превышения — −1 п.п.,
-    потолок −5 п.п. Если атакующий сильнее или равен — 0 (бонуса нет)."""
+    Если max ХП защитника больше max ХП атакующего, то каждые 100 ХП превышения — −1%,
+    потолок −5%. Если атакующий сильнее или равен — 0 (бонуса нет)."""
     if defender_max_hp is None or defender_max_hp <= 0 or defender_max_hp <= attacker_max_hp:
         return 0
     diff = defender_max_hp - attacker_max_hp
@@ -1375,7 +1375,7 @@ def _resolve_starting_pct(base_pct: int, attacker_roll: Optional[int], defender_
     """Возвращает (starting_pct, gap_bonus_pp) c учётом бонуса разрыва ролла.
 
     Если бонус разрыва даёт более высокий %, чем base_pct — стартовый %
-    повышается до тарифного, а gap_bonus_pp = разница в п.п. Иначе (base_pct, 0)."""
+    повышается до тарифного, а gap_bonus_pp = разница в процентах. Иначе (base_pct, 0)."""
     gap_pct = _roll_gap_target_pct(attacker_roll, defender_roll)
     if gap_pct is not None and gap_pct > base_pct:
         return gap_pct, gap_pct - base_pct
@@ -1734,7 +1734,7 @@ def _apply_attack_damage(
 
     Если переданы attacker_roll и defender_roll и их разрыв ≥500 — базовый %
     урона подменяется на тарифный (20/25/30%). Затем из стартового % вычитается
-    «броня» сильного защитника по max ОП. Минимум — 1%."""
+    «броня» сильного защитника по max ХП. Минимум — 1%."""
     stats = CLASS_STATS[attacker_ch.char_class]
     base_pct = stats["damage_pct"]
     starting_pct, gap_bonus = _resolve_starting_pct(base_pct, attacker_roll, defender_roll)
@@ -1743,11 +1743,11 @@ def _apply_attack_damage(
     damage = max(1, (defender_ch.max_hp * effective_pct) // 100)
     before = defender_ch.current_hp
     defender_ch.current_hp = max(0, before - damage)
-    pct_label = f"{effective_pct}% от {defender_ch.max_hp} ОП"
+    pct_label = f"{effective_pct}% от макс. ХП ({defender_ch.max_hp})"
     if gap_bonus > 0:
-        pct_label += f" (+{gap_bonus} п.п. бонус за разрыв ролла)"
+        pct_label += f" (+{gap_bonus}% за крупный перевес в ролле)"
     if reduction_pp > 0:
-        pct_label += f" (−{reduction_pp} п.п. за преимущество защитника)"
+        pct_label += f" (−{reduction_pp}% — защитник крепче по ХП)"
     return damage, before, pct_label
 
 
@@ -2252,7 +2252,7 @@ def _team_battle_damage_pct(
     """Возвращает (damage_pct, verdict) для /attack в командном бою.
 
     Боец: ролл > 30 → −15% (полный), иначе −5% (слабый). Лекарь: ролл > 30 → −5%,
-    иначе −2% (слабый). Бонус сильного защитника по ОП учитывается отдельно."""
+    иначе −2% (слабый). Бонус сильного защитника по ХП учитывается отдельно."""
     if attacker_ch.char_class == CharClass.ATTACKER:
         if roll > HEAL_LOW_ROLL_THRESHOLD:
             pct = CLASS_STATS[CharClass.ATTACKER]["damage_pct"]
@@ -2631,8 +2631,8 @@ def _build_battle_resolve_result(
         dmg = max(1, (responder_ch.max_hp * eff) // 100)
         before = responder_ch.current_hp
         responder_ch.current_hp = max(0, before - dmg)
-        gap_note = f" (+{gap_bonus} п.п. бонус за разрыв ролла)" if gap_bonus > 0 else ""
-        red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
+        gap_note = f" (+{gap_bonus}% за крупный перевес в ролле)" if gap_bonus > 0 else ""
+        red_note = f" (−{reduction_pp}% — защитник крепче по ХП)" if reduction_pp > 0 else ""
         lines.append(
             f"💥 <b>{initiator_name}</b> попал — {verdict}{gap_note}{red_note}. "
             f"{html.escape(responder_ch.name)}: {before} → "
@@ -2655,8 +2655,8 @@ def _build_battle_resolve_result(
             dmg = max(1, (initiator_ch.max_hp * eff) // 100)
             before = initiator_ch.current_hp
             initiator_ch.current_hp = max(0, before - dmg)
-            gap_note = f" (+{gap_bonus} п.п. бонус за разрыв ролла)" if gap_bonus > 0 else ""
-            red_note = f" (бонус по ОП: −{reduction_pp} п.п.)" if reduction_pp > 0 else ""
+            gap_note = f" (+{gap_bonus}% за крупный перевес в ролле)" if gap_bonus > 0 else ""
+            red_note = f" (−{reduction_pp}% — защитник крепче по ХП)" if reduction_pp > 0 else ""
             lines.append(
                 f"💥 <b>{responder_name}</b> в ответ — {verdict}{gap_note}{red_note}. "
                 f"{html.escape(initiator_ch.name)}: {before} → "
@@ -3776,7 +3776,7 @@ async def cmd_help(message: Message) -> None:
         "• <code>/attack &lt;ваш макс&gt;</code> — соперник отвечает любой из: "
         "<code>/defend</code>, <code>/attack</code> (контр-атака) или <code>/heal</code> (хил-ответ). "
         "Бот кидает обоим рандом, у кого выпало больше — тот перебил.\n"
-        "  Атака перебила → урон классом% от max HP защитника (с учётом бонуса по ОП).\n"
+        "  Атака перебила → урон классом% от макс. ХП защитника (с учётом «брони» сильного защитника).\n"
         "  Контр-атака перебила → урон по инициатору. Хил-ответ перебил → ответчик лечится. Ничья — оба промахнулись.\n"
         f"• <code>/heal &lt;макс&gt;</code> у Лекаря: соло. Бот кидает 1..макс; "
         f"бросок > {HEAL_LOW_ROLL_THRESHOLD} → +{heal['heal_pct']}% (полный). Иначе — мини-хил +{HEALER_LOW_HEAL_PCT}%.\n"
@@ -3804,11 +3804,11 @@ async def cmd_help(message: Message) -> None:
         "сохраняется в карточке персонажа. Восстановить ХП можно вручную в /persona или "
         "через /jesus.</i>\n\n"
         "<b>⚖️ Бонус сильному защитнику</b>\n"
-        f"Если у защитника max ОП больше, чем у атакующего, урон атакующего снижается "
-        f"за каждые {HP_ADVANTAGE_STEP} ОП превышения на 1 п.п. "
-        f"(потолок −{HP_ADVANTAGE_MAX_REDUCTION} п.п.).\n"
-        f"Например: атак. 200 vs защ. 500 → разница 300 → −3 п.п. "
-        f"(Боец бьёт 15−3 = 12% от max ОП защитника).\n"
+        f"Если у защитника макс. ХП больше, чем у атакующего, урон атакующего снижается "
+        f"за каждые {HP_ADVANTAGE_STEP} ХП превышения на 1%. "
+        f"Потолок снижения — −{HP_ADVANTAGE_MAX_REDUCTION}%.\n"
+        f"Например: атак. 200 ХП vs защ. 500 ХП → разница 300 → −3%. "
+        f"Боец бьёт 15−3 = 12% от макс. ХП защитника.\n"
         "Минимум — 1% за попадание. На лечение не влияет.\n\n"
         "<b>🎯 Бонус за разрыв ролла</b>\n"
         "Если бросок атакующего сильно превышает бросок защитника, базовый % "
@@ -3817,7 +3817,7 @@ async def cmd_help(message: Message) -> None:
         "• разрыв 800–999 → 25% урона\n"
         "• разрыв ≥1000 → 30% урона\n"
         "Меньше 500 — базовый % по классу (15% Боец / 5% Лекарь). "
-        "«Броня» защитника по max ОП вычитается из итогового % уже после "
+        "«Броня» защитника по макс. ХП вычитается из итогового % уже после "
         "применения бонуса. Работает и в дуэли, и в /buttle. На лечение не влияет."
     )
 
