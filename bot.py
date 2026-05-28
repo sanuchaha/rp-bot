@@ -351,6 +351,50 @@ def display_name(user_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _serialize_duel(d: "Duel") -> dict[str, Any]:
+    return {
+        "duel_id": d.duel_id,
+        "chat_id": d.chat_id,
+        "initiator_id": d.initiator_id,
+        "opponent_id": d.opponent_id,
+        "initiator_char": d.initiator_char,
+        "opponent_char": d.opponent_char,
+        "status": d.status.value,
+        "message_id": d.message_id,
+        "pending_kind": d.pending_kind,
+        "pending_attacker_id": d.pending_attacker_id,
+        "pending_attack_cap": d.pending_attack_cap,
+        "pending_attack_roll": d.pending_attack_roll,
+    }
+
+
+def _serialize_battle(b: "Battle") -> dict[str, Any]:
+    # deadline_ts использует монотонный loop.time(), который не переживает рестарт.
+    # Сохраняем «оставшиеся секунды» для REGISTERING; на load пересчитаем в свежий
+    # монотонный дедлайн.
+    seconds_left: Optional[float] = None
+    if b.status == BattleStatus.REGISTERING:
+        try:
+            seconds_left = max(0.0, b.deadline_ts - asyncio.get_running_loop().time())
+        except RuntimeError:
+            seconds_left = None
+    return {
+        "battle_id": b.battle_id,
+        "chat_id": b.chat_id,
+        "initiator_id": b.initiator_id,
+        "num_teams": b.num_teams,
+        "teams": {str(t): list(users) for t, users in b.teams.items()},
+        "char_by_user": {str(uid): n for uid, n in b.char_by_user.items()},
+        "deadline_ts": b.deadline_ts,
+        "deadline_seconds_left": seconds_left,
+        "status": b.status.value,
+        "message_id": b.message_id,
+        "heal_cooldown": {str(uid): cd for uid, cd in b.heal_cooldown.items()},
+        "heal_hot": {str(uid): dict(h) for uid, h in b.heal_hot.items()},
+        "pending_attacks": {str(uid): dict(pa) for uid, pa in b.pending_attacks.items()},
+    }
+
+
 def _serialize_state() -> dict[str, Any]:
     return {
         "characters": {
@@ -369,6 +413,20 @@ def _serialize_state() -> dict[str, Any]:
         "username_to_id": username_to_id,
         "user_display": {str(uid): name for uid, name in user_display.items()},
         "reroll_users": sorted(reroll_users),
+        "duels": [
+            _serialize_duel(d)
+            for d in duels.values()
+            if d.status != DuelStatus.FINISHED
+        ],
+        "user_duel": {str(uid): did for uid, did in user_duel.items()},
+        "next_duel_id": _next_duel_id,
+        "battles": [
+            _serialize_battle(b)
+            for b in battles.values()
+            if b.status != BattleStatus.FINISHED
+        ],
+        "user_battle": {str(uid): bid for uid, bid in user_battle.items()},
+        "next_battle_id": _next_battle_id,
     }
 
 
@@ -463,6 +521,139 @@ async def load_state() -> None:
             reroll_users.add(int(uid_raw))
         except (ValueError, TypeError):
             continue
+
+    global _next_duel_id, _next_battle_id
+
+    restored_duels = 0
+    for d_data in data.get("duels", []):
+        try:
+            duel = Duel(
+                duel_id=int(d_data["duel_id"]),
+                chat_id=int(d_data["chat_id"]),
+                initiator_id=int(d_data["initiator_id"]),
+                opponent_id=int(d_data["opponent_id"]),
+                initiator_char=str(d_data["initiator_char"]),
+                opponent_char=str(d_data["opponent_char"]),
+                status=DuelStatus(d_data.get("status", DuelStatus.PENDING.value)),
+                message_id=d_data.get("message_id"),
+                pending_kind=d_data.get("pending_kind"),
+                pending_attacker_id=d_data.get("pending_attacker_id"),
+                pending_attack_cap=d_data.get("pending_attack_cap"),
+                pending_attack_roll=d_data.get("pending_attack_roll"),
+            )
+        except (KeyError, ValueError, TypeError):
+            continue
+        if duel.status == DuelStatus.FINISHED:
+            continue
+        duels[duel.duel_id] = duel
+        restored_duels += 1
+        if duel.status == DuelStatus.ACTIVE:
+            for uid, cname in (
+                (duel.initiator_id, duel.initiator_char),
+                (duel.opponent_id, duel.opponent_char),
+            ):
+                ch = characters.get(uid, {}).get(cname)
+                if ch is not None:
+                    ch.in_battle = True
+
+    for uid_str, did in data.get("user_duel", {}).items():
+        try:
+            uid = int(uid_str)
+            did_int = int(did)
+        except (ValueError, TypeError):
+            continue
+        if did_int in duels:
+            user_duel[uid] = did_int
+
+    try:
+        _next_duel_id = max(int(data.get("next_duel_id", 1)), _next_duel_id)
+    except (ValueError, TypeError):
+        pass
+    if duels:
+        _next_duel_id = max(_next_duel_id, max(duels.keys()) + 1)
+
+    restored_battles = 0
+    for b_data in data.get("battles", []):
+        try:
+            teams_raw = b_data.get("teams", {})
+            teams: dict[int, list[int]] = {}
+            for t_str, users in teams_raw.items():
+                teams[int(t_str)] = [int(u) for u in users]
+            char_by_user_raw = b_data.get("char_by_user", {})
+            char_by_user: dict[int, str] = {
+                int(uid_s): str(n) for uid_s, n in char_by_user_raw.items()
+            }
+            heal_cooldown_raw = b_data.get("heal_cooldown", {})
+            heal_cooldown: dict[int, int] = {
+                int(uid_s): int(cd) for uid_s, cd in heal_cooldown_raw.items()
+            }
+            heal_hot_raw = b_data.get("heal_hot", {})
+            heal_hot: dict[int, dict] = {
+                int(uid_s): dict(h) for uid_s, h in heal_hot_raw.items()
+            }
+            pending_attacks_raw = b_data.get("pending_attacks", {})
+            pending_attacks: dict[int, dict] = {
+                int(uid_s): dict(pa) for uid_s, pa in pending_attacks_raw.items()
+            }
+            status_str = b_data.get("status", BattleStatus.REGISTERING.value)
+            status = BattleStatus(status_str)
+            # Пересчитываем deadline_ts в свежий монотонный таймстамп текущего процесса.
+            if status == BattleStatus.REGISTERING:
+                seconds_left = b_data.get("deadline_seconds_left")
+                if seconds_left is None:
+                    # Старая сериализация без поля — даём 30 сек грейс на ответ.
+                    seconds_left = 30.0
+                deadline_ts = (
+                    asyncio.get_running_loop().time() + max(0.0, float(seconds_left))
+                )
+            else:
+                deadline_ts = float(b_data.get("deadline_ts", 0.0))
+            battle = Battle(
+                battle_id=int(b_data["battle_id"]),
+                chat_id=int(b_data["chat_id"]),
+                initiator_id=int(b_data["initiator_id"]),
+                num_teams=int(b_data["num_teams"]),
+                teams=teams,
+                char_by_user=char_by_user,
+                deadline_ts=deadline_ts,
+                status=status,
+                message_id=b_data.get("message_id"),
+                heal_cooldown=heal_cooldown,
+                heal_hot=heal_hot,
+                pending_attacks=pending_attacks,
+            )
+        except (KeyError, ValueError, TypeError):
+            continue
+        if battle.status == BattleStatus.FINISHED:
+            continue
+        battles[battle.battle_id] = battle
+        restored_battles += 1
+        if battle.status == BattleStatus.ACTIVE:
+            for uid, cname in battle.char_by_user.items():
+                ch = characters.get(uid, {}).get(cname)
+                if ch is not None and ch.current_hp > 0:
+                    ch.in_battle = True
+
+    for uid_str, bid in data.get("user_battle", {}).items():
+        try:
+            uid = int(uid_str)
+            bid_int = int(bid)
+        except (ValueError, TypeError):
+            continue
+        if bid_int in battles:
+            user_battle[uid] = bid_int
+
+    try:
+        _next_battle_id = max(int(data.get("next_battle_id", 1)), _next_battle_id)
+    except (ValueError, TypeError):
+        pass
+    if battles:
+        _next_battle_id = max(_next_battle_id, max(battles.keys()) + 1)
+
+    if restored_duels or restored_battles:
+        logging.info(
+            "Восстановлено: %d дуэлей, %d боёв.", restored_duels, restored_battles
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3343,6 +3534,23 @@ async def _battle_timer(battle_id: int, deadline: float, bot: Bot) -> None:
         _battle_timers.pop(battle_id, None)
 
 
+def _restart_battle_timers(bot: Bot) -> None:
+    """После рестарта процесса перевешиваем таймеры на все REGISTERING-бои."""
+    started = 0
+    for battle in battles.values():
+        if battle.status != BattleStatus.REGISTERING:
+            continue
+        if battle.battle_id in _battle_timers:
+            continue
+        task = asyncio.create_task(
+            _battle_timer(battle.battle_id, battle.deadline_ts, bot)
+        )
+        _battle_timers[battle.battle_id] = task
+        started += 1
+    if started:
+        logging.info("Перезапущено таймеров набора команд: %d.", started)
+
+
 async def _start_battle(bot: Bot, battle: Battle, reason: str = "") -> None:
     if not _can_start_battle(battle):
         await _cancel_battle(bot, battle, reason="недостаточно команд")
@@ -4557,6 +4765,8 @@ async def _setup(token: str) -> tuple[Bot, Dispatcher]:
     logging.info("Бот авторизован как @%s.", BOT_USERNAME)
 
     await bot.set_my_commands(BOT_COMMANDS)
+
+    _restart_battle_timers(bot)
 
     return bot, dp
 
