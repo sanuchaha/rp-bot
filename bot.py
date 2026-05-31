@@ -671,6 +671,12 @@ class EditState(StatesGroup):
     waiting_for_hp = State()
 
 
+class ManageState(StatesGroup):
+    """FSM для /manage — ввод владельцем нового значения ХП/max ХП чужого перса."""
+    waiting_for_hp = State()
+    waiting_for_max_hp = State()
+
+
 router = Router()
 
 
@@ -3974,6 +3980,10 @@ async def cmd_help(message: Message) -> None:
         f"только свой бросок. Команды владельца: "
         f"<code>/grant_reroll @user</code>, <code>/revoke_reroll @user</code>, "
         f"<code>/reroll_list</code>.\n\n"
+        "<b>🛠 Управление персонажами (только владелец)</b>\n"
+        "<code>/manage</code> — меню владельца. Полностью полечить чужого перса, "
+        "поставить текущее ХП, изменить max ХП или удалить перса. "
+        "ХП и удаление работают только вне боя (попроси игрока /yield).\n\n"
         "<b>⚔️ Классы и проценты от макс. ХП</b>\n"
         f"{CLASS_LABELS[CharClass.ATTACKER]}\n"
         f"    🩸 урон: −{atk['damage_pct']}%   🩹 лечение: +{atk['heal_pct']}%\n"
@@ -4223,6 +4233,470 @@ async def on_jesus_choice(cb: CallbackQuery) -> None:
         f"Чудотворец: {healer}"
     )
     await cb.answer("Воскрешено!", show_alert=False)
+
+
+# ---------------------------------------------------------------------------
+# /manage — меню владельца: полностью полечить / поставить ХП / max ХП / удалить
+# ---------------------------------------------------------------------------
+
+_MANAGE_MAX_HP_CAP = 99999  # верхний предел для max ХП и текущего ХП
+
+# token -> {"action": "heal"|"sethp"|"setmax"|"delete", "items": [(uid, name), ...]}
+_manage_menus: dict[str, dict[str, Any]] = {}
+_MAX_MANAGE_MENUS = 50
+
+_MANAGE_ACTION_TITLES = {
+    "heal": "🩹 Полностью восстановить ХП",
+    "sethp": "⚙️ Поставить текущее ХП",
+    "setmax": "🔢 Изменить max ХП",
+    "delete": "🗑 Удалить персонажа",
+}
+
+
+def _gc_manage_menus() -> None:
+    if len(_manage_menus) > _MAX_MANAGE_MENUS:
+        for k in list(_manage_menus.keys())[: len(_manage_menus) - _MAX_MANAGE_MENUS]:
+            _manage_menus.pop(k, None)
+
+
+def _manage_collect_chars(action: str) -> list[tuple[int, "Character"]]:
+    """Собирает список (uid, ch) для выбранного действия.
+
+    heal/sethp — только персонажи с current < max. delete/setmax — все.
+    Сортировка: по владельцу, потом по имени персонажа.
+    """
+    items: list[tuple[int, "Character"]] = []
+    for uid, chars in characters.items():
+        for ch in chars.values():
+            if action in ("heal", "sethp") and ch.current_hp >= ch.max_hp:
+                continue
+            items.append((uid, ch))
+    items.sort(key=lambda x: (display_name(x[0]).lower(), x[1].name.lower()))
+    return items
+
+
+def _manage_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🩹 Полностью восстановить ХП", callback_data="manage:menu:heal")],
+            [InlineKeyboardButton(text="⚙️ Поставить текущее ХП", callback_data="manage:menu:sethp")],
+            [InlineKeyboardButton(text="🔢 Изменить max ХП", callback_data="manage:menu:setmax")],
+            [InlineKeyboardButton(text="🗑 Удалить персонажа", callback_data="manage:menu:delete")],
+            [InlineKeyboardButton(text="❌ Закрыть", callback_data="manage:close")],
+        ]
+    )
+
+
+@router.message(Command("manage"))
+async def cmd_manage(message: Message) -> None:
+    remember_user(message.from_user)
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.answer("⛔️ Команда /manage доступна только владельцу бота.")
+        return
+    await message.answer(
+        "🛠 <b>Управление персонажами</b>\n"
+        "<i>Только владелец бота. Изменения чужих персонажей — на твой риск.</i>",
+        reply_markup=_manage_main_kb(),
+    )
+
+
+def _manage_render_list(action: str) -> tuple[str, InlineKeyboardMarkup]:
+    items = _manage_collect_chars(action)
+    title = _MANAGE_ACTION_TITLES.get(action, "Управление")
+
+    if not items:
+        return (
+            f"<b>{title}</b>\n\n<i>Подходящих персонажей нет.</i>",
+            InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="« Назад", callback_data="manage:back")]]
+            ),
+        )
+
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(6)
+    _manage_menus[token] = {
+        "action": action,
+        "items": [(uid, ch.name) for uid, ch in items],
+    }
+    _gc_manage_menus()
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, (uid, ch) in enumerate(items):
+        owner = display_name(uid)
+        engaged = " ⚔️" if (ch.in_battle or _is_char_engaged(uid, ch.name)) else ""
+        label = f"{ch.name} ({ch.current_hp}/{ch.max_hp}) · {owner}{engaged}"
+        if len(label) > 64:
+            label = label[:61] + "…"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"manage:pick:{token}:{idx}")]
+        )
+    rows.append([InlineKeyboardButton(text="« Назад", callback_data="manage:back")])
+
+    if action == "heal":
+        note = "Восстановит ХП до максимума. Без сознания (ХП = 0) — сначала /jesus."
+    elif action == "sethp":
+        note = "Выбери персонажа, потом введи число от 1 до max ХП. Только вне боя."
+    elif action == "setmax":
+        note = f"Выбери персонажа, потом введи новый max (1..{_MANAGE_MAX_HP_CAP}). Только вне боя."
+    else:  # delete
+        note = "После выбора будет подтверждение. Только вне боя."
+
+    return (
+        f"<b>{title}</b>\n<i>{note}</i>\n\nВсего: {len(items)}",
+        InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data == "manage:close")
+async def on_manage_close(cb: CallbackQuery) -> None:
+    if OWNER_ID is None or cb.from_user.id != OWNER_ID:
+        await cb.answer("⛔️ Только владелец.", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text("Меню /manage закрыто.")
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data == "manage:back")
+async def on_manage_back(cb: CallbackQuery) -> None:
+    if OWNER_ID is None or cb.from_user.id != OWNER_ID:
+        await cb.answer("⛔️ Только владелец.", show_alert=True)
+        return
+    try:
+        await cb.message.edit_text(
+            "🛠 <b>Управление персонажами</b>\n<i>Только владелец бота.</i>",
+            reply_markup=_manage_main_kb(),
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("manage:menu:"))
+async def on_manage_menu(cb: CallbackQuery) -> None:
+    if OWNER_ID is None or cb.from_user.id != OWNER_ID:
+        await cb.answer("⛔️ Только владелец.", show_alert=True)
+        return
+    parts = (cb.data or "").split(":", 2)
+    if len(parts) != 3:
+        await cb.answer()
+        return
+    action = parts[2]
+    if action not in _MANAGE_ACTION_TITLES:
+        await cb.answer()
+        return
+    text, kb = _manage_render_list(action)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("manage:pick:"))
+async def on_manage_pick(cb: CallbackQuery, state: FSMContext) -> None:
+    if OWNER_ID is None or cb.from_user.id != OWNER_ID:
+        await cb.answer("⛔️ Только владелец.", show_alert=True)
+        return
+    parts = (cb.data or "").split(":", 3)
+    if len(parts) != 4:
+        await cb.answer()
+        return
+    token = parts[2]
+    try:
+        idx = int(parts[3])
+    except ValueError:
+        await cb.answer()
+        return
+
+    info = _manage_menus.get(token)
+    if not info:
+        await cb.answer("Меню устарело, открой /manage заново.", show_alert=True)
+        return
+    items = info["items"]
+    if idx < 0 or idx >= len(items):
+        await cb.answer("Уже не актуально.", show_alert=True)
+        return
+
+    uid, name = items[idx]
+    chars = characters.get(uid) or {}
+    ch = chars.get(name)
+    if ch is None:
+        await cb.answer("Персонаж не найден (видимо, удалён).", show_alert=True)
+        return
+
+    action = info["action"]
+
+    # Полный хил — выполняем сразу.
+    if action == "heal":
+        if ch.current_hp <= 0:
+            await cb.answer(
+                "💀 Персонаж без сознания. Сначала воскреси через /jesus.",
+                show_alert=True,
+            )
+            return
+        if ch.current_hp >= ch.max_hp:
+            await cb.answer("ХП уже максимум.", show_alert=True)
+            return
+        before = ch.current_hp
+        ch.current_hp = ch.max_hp
+        save_state()
+        owner_label = html.escape(display_name(uid))
+        name_html = html.escape(name)
+        try:
+            await cb.message.edit_text(
+                f"🩹 <b>{name_html}</b> ({owner_label}) полностью полечен: "
+                f"{before} → <b>{ch.max_hp}</b>/{ch.max_hp}."
+            )
+        except Exception:
+            pass
+        await cb.answer("Полечено")
+        return
+
+    # Удаление — подтверждение.
+    if action == "delete":
+        if _is_char_engaged(uid, name) or ch.in_battle:
+            await cb.answer(
+                "Персонаж в бою — нельзя удалить. Сначала /yield.",
+                show_alert=True,
+            )
+            return
+        owner_label = html.escape(display_name(uid))
+        name_html = html.escape(name)
+        rows = [
+            [InlineKeyboardButton(
+                text="🗑 Удалить навсегда",
+                callback_data=f"manage:delconf:{token}:{idx}",
+            )],
+            [InlineKeyboardButton(text="« Назад", callback_data="manage:menu:delete")],
+        ]
+        try:
+            await cb.message.edit_text(
+                f"🗑 <b>Удалить навсегда?</b>\n\n"
+                f"Персонаж: <b>{name_html}</b>\n"
+                f"Владелец: {owner_label}\n"
+                f"ХП: {ch.current_hp}/{ch.max_hp}\n\n"
+                f"<i>Действие необратимо.</i>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
+    # SetHP / SetMax — ставим FSM, ждём число.
+    if action in ("sethp", "setmax"):
+        if _is_char_engaged(uid, name) or ch.in_battle:
+            await cb.answer(
+                "Персонаж в бою — нельзя менять ХП. Сначала /yield.",
+                show_alert=True,
+            )
+            return
+        if action == "sethp":
+            await state.set_state(ManageState.waiting_for_hp)
+            field_name = "текущее"
+            range_hint = f"от 1 до {ch.max_hp}"
+        else:
+            await state.set_state(ManageState.waiting_for_max_hp)
+            field_name = "max"
+            range_hint = f"от 1 до {_MANAGE_MAX_HP_CAP}"
+        await state.update_data(
+            manage_target_uid=uid,
+            manage_target_name=name,
+        )
+        owner_label = html.escape(display_name(uid))
+        name_html = html.escape(name)
+        try:
+            await cb.message.edit_text(
+                f"✏️ Введи новое <b>{field_name} ХП</b> для <b>{name_html}</b> ({owner_label}).\n"
+                f"Сейчас: {ch.current_hp}/{ch.max_hp}.\n"
+                f"Допустимо: {range_hint}.\n\n"
+                f"<i>Просто ответь числом следующим сообщением.</i>"
+            )
+        except Exception:
+            pass
+        await cb.answer()
+        return
+
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("manage:delconf:"))
+async def on_manage_delconf(cb: CallbackQuery) -> None:
+    if OWNER_ID is None or cb.from_user.id != OWNER_ID:
+        await cb.answer("⛔️ Только владелец.", show_alert=True)
+        return
+    parts = (cb.data or "").split(":", 3)
+    if len(parts) != 4:
+        await cb.answer()
+        return
+    token = parts[2]
+    try:
+        idx = int(parts[3])
+    except ValueError:
+        await cb.answer()
+        return
+    info = _manage_menus.get(token)
+    if not info:
+        await cb.answer("Меню устарело.", show_alert=True)
+        return
+    items = info["items"]
+    if idx < 0 or idx >= len(items):
+        await cb.answer("Уже не актуально.", show_alert=True)
+        return
+    uid, name = items[idx]
+    chars = characters.get(uid) or {}
+    ch = chars.get(name)
+    if ch is None:
+        await cb.answer("Уже удалён.", show_alert=True)
+        try:
+            await cb.message.edit_text("Уже удалён.")
+        except Exception:
+            pass
+        return
+    if _is_char_engaged(uid, name) or ch.in_battle:
+        await cb.answer(
+            "Персонаж в бою — нельзя удалить. Сначала /yield.",
+            show_alert=True,
+        )
+        return
+
+    characters[uid].pop(name, None)
+    if not characters[uid]:
+        characters.pop(uid, None)
+    if active_char.get(uid) == name:
+        remaining = char_list(uid)
+        if remaining:
+            active_char[uid] = remaining[0].name
+        else:
+            active_char.pop(uid, None)
+    save_state()
+
+    owner_label = html.escape(display_name(uid))
+    name_html = html.escape(name)
+    try:
+        await cb.message.edit_text(
+            f"🗑 Персонаж <b>{name_html}</b> ({owner_label}) удалён навсегда."
+        )
+    except Exception:
+        pass
+    await cb.answer("Удалено")
+
+
+@router.message(ManageState.waiting_for_hp)
+async def on_manage_hp_input(message: Message, state: FSMContext) -> None:
+    remember_user(message.from_user)
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        # FSM scope-ом ограничен (chat, user), но на всякий случай.
+        return
+    data = await state.get_data()
+    uid = data.get("manage_target_uid")
+    name = data.get("manage_target_name")
+    if uid is None or not name:
+        await state.clear()
+        await message.answer("Контекст утерян, открой /manage заново.")
+        return
+
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer(
+            "⚠️ Нужно положительное число. Попробуй ещё раз или /manage чтобы начать заново."
+        )
+        return
+    new_val = int(text)
+
+    ch = characters.get(uid, {}).get(name)
+    if ch is None:
+        await state.clear()
+        await message.answer("Персонаж не найден, открой /manage заново.")
+        return
+    if _is_char_engaged(uid, name) or ch.in_battle:
+        await state.clear()
+        await message.answer("Персонаж в бою — изменить ХП нельзя. Сначала /yield.")
+        return
+    if new_val < 1:
+        await message.answer("⚠️ ХП должно быть от 1 и выше.")
+        return
+    if new_val > ch.max_hp:
+        await message.answer(
+            f"⚠️ Текущее ХП не может быть больше max ({ch.max_hp}). "
+            f"Если нужно — сначала измени max через /manage."
+        )
+        return
+
+    before = ch.current_hp
+    ch.current_hp = new_val
+    save_state()
+    await state.clear()
+
+    owner_label = html.escape(display_name(uid))
+    name_html = html.escape(name)
+    await message.answer(
+        f"⚙️ <b>{name_html}</b> ({owner_label}): ХП {before} → "
+        f"<b>{new_val}</b>/{ch.max_hp}."
+    )
+
+
+@router.message(ManageState.waiting_for_max_hp)
+async def on_manage_max_hp_input(message: Message, state: FSMContext) -> None:
+    remember_user(message.from_user)
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        return
+    data = await state.get_data()
+    uid = data.get("manage_target_uid")
+    name = data.get("manage_target_name")
+    if uid is None or not name:
+        await state.clear()
+        await message.answer("Контекст утерян, открой /manage заново.")
+        return
+
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer(
+            "⚠️ Нужно положительное число. Попробуй ещё раз или /manage чтобы начать заново."
+        )
+        return
+    new_max = int(text)
+
+    ch = characters.get(uid, {}).get(name)
+    if ch is None:
+        await state.clear()
+        await message.answer("Персонаж не найден, открой /manage заново.")
+        return
+    if _is_char_engaged(uid, name) or ch.in_battle:
+        await state.clear()
+        await message.answer("Персонаж в бою — изменить max ХП нельзя. Сначала /yield.")
+        return
+    if new_max < 1:
+        await message.answer("⚠️ max ХП должно быть от 1 и выше.")
+        return
+    if new_max > _MANAGE_MAX_HP_CAP:
+        await message.answer(f"⚠️ Лимит сверху: {_MANAGE_MAX_HP_CAP}.")
+        return
+
+    before_cur = ch.current_hp
+    before_max = ch.max_hp
+    ch.max_hp = new_max
+    truncated = False
+    if ch.current_hp > new_max:
+        ch.current_hp = new_max
+        truncated = True
+    save_state()
+    await state.clear()
+
+    owner_label = html.escape(display_name(uid))
+    name_html = html.escape(name)
+    suffix = (
+        f"\n<i>Текущее ХП обрезано с {before_cur} до {new_max}.</i>"
+        if truncated
+        else ""
+    )
+    await message.answer(
+        f"🔢 <b>{name_html}</b> ({owner_label}): max ХП {before_max} → <b>{new_max}</b>. "
+        f"Текущее: {ch.current_hp}/{new_max}.{suffix}"
+    )
 
 
 # ---------------------------------------------------------------------------
