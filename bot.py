@@ -5198,6 +5198,7 @@ BOT_COMMANDS = [
     BotCommand(command="yield", description="Выйти из дуэли / командного боя"),
     BotCommand(command="top", description="Список всех игроков и их персонажей"),
     BotCommand(command="jesus", description="Воскресить персонажа из больницы"),
+    BotCommand(command="manage", description="Меню владельца: лечить/менять ХП/удалять чужих персов"),
     BotCommand(command="help", description="Помощь"),
 ]
 
